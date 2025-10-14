@@ -24,6 +24,14 @@ jobs:
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
+      
+      - name: Terraform init (pre-clean)
+        continue-on-error: true
+        run: terraform init -input=false
+
+      - name: Terraform destroy (pre-clean)
+        continue-on-error: true
+        run: terraform destroy -auto-approve -input=false
 
       - name: Terraform init & apply
         run: |
