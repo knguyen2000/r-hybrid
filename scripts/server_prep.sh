@@ -16,7 +16,7 @@ sudo rm -rf /var/cache/dnf || true
 retry sudo dnf -y makecache
 
 # Install packages (no cache, allow best resolution)
-retry sudo dnf -y install --setopt=keepcache=0 --best --allowerasing httpd iperf3 coreutils
+retry sudo dnf -y install --setopt=keepcache=0 --best --allowerasing httpd iperf3 coreutils bc
 
 # Prepare test payloads
 sudo mkdir -p /var/www/html/hls

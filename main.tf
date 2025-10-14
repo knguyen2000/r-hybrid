@@ -172,9 +172,10 @@ resource "aws_s3_bucket_versioning" "results" {
 }
 
 # ---------------------------
-# EC2 Instances (no user-data; SSM bootstrap)
+# EC2 Instances
 # ---------------------------
-resource "aws_instance" "server" {
+# Server_a for the intra-AZ (same subnet) tests.
+resource "aws_instance" "server_a" {
   ami                         = data.aws_ami.al2023.id
   instance_type               = var.instance_type
   subnet_id                   = aws_subnet.subnet_a.id
@@ -183,10 +184,25 @@ resource "aws_instance" "server" {
   iam_instance_profile        = aws_iam_instance_profile.ec2_ssm_profile.name
 
   tags = {
-    Name = "network-test-server"
+    Name = "network-test-server-a"
   }
 }
 
+# Server_b in the other AZ for cross-AZ tests.
+resource "aws_instance" "server_b" {
+  ami                         = data.aws_ami.al2023.id
+  instance_type               = var.instance_type
+  subnet_id                   = aws_subnet.subnet_b.id
+  vpc_security_group_ids      = [aws_security_group.allow_tests.id]
+  associate_public_ip_address = true
+  iam_instance_profile        = aws_iam_instance_profile.ec2_ssm_profile.name
+
+  tags = {
+    Name = "network-test-server-b"
+  }
+}
+
+# The client is always in the primary subnet.
 resource "aws_instance" "client" {
   ami                         = data.aws_ami.al2023.id
   instance_type               = var.instance_type
