@@ -45,36 +45,6 @@ jobs:
           echo "client=$(terraform output -raw client_public_ip)" >> $GITHUB_OUTPUT
           echo "client_name=$(terraform output -raw client_name_tag)" >> $GITHUB_OUTPUT
           echo "results_bucket=$(terraform output -raw results_bucket_name)" >> $GITHUB_OUTPUT
-
-      # --- Deep debug: tags, instance profile, SGs, and current SSM managed list
-      - name: Debug EC2 + SSM state
-        if: always()
-        shell: bash
-        run: |
-          set -euo pipefail
-          SID='${{ steps.ids.outputs.sid }}'
-          CID='${{ steps.ids.outputs.cid }}'
-
-          echo "=== EC2 Describe (server) ==="
-          aws ec2 describe-instances --instance-ids "$SID" \
-            --query "Reservations[0].Instances[0].{ID:InstanceId,State:State.Name,PrivIP:PrivateIpAddress,PubIP:PublicIpAddress,Subnet:SubnetId,Profile:IamInstanceProfile.Arn,SGs:SecurityGroups[*].GroupId,Tags:Tags}" \
-            --output table || true
-
-          echo "=== EC2 Describe (client) ==="
-          aws ec2 describe-instances --instance-ids "$CID" \
-            --query "Reservations[0].Instances[0].{ID:InstanceId,State:State.Name,PrivIP:PrivateIpAddress,PubIP:PublicIpAddress,Subnet:SubnetId,Profile:IamInstanceProfile.Arn,SGs:SecurityGroups[*].GroupId,Tags:Tags}" \
-            --output table || true
-
-          echo "=== IAM Instance Profile Associations ==="
-          aws ec2 describe-iam-instance-profile-associations \
-            --filters "Name=instance-id,Values=$SID,$CID" \
-            --query "IamInstanceProfileAssociations[].{Inst:InstanceId,State:State,ProfileArn:IamInstanceProfile.Arn}" \
-            --output table || true
-
-          echo "=== SSM Managed Instances (PingStatus) ==="
-          aws ssm describe-instance-information \
-            --query "InstanceInformationList[].{ID:InstanceId,Name:Name,Ping:PingStatus,Agent:AgentVersion,Platform:PlatformType,IP:IPAddress}" \
-            --output table || true
       
       - name: Wait until SSM is online (server & client)
         id: ssmwait
@@ -110,11 +80,41 @@ jobs:
           echo "sid=$SID" >> $GITHUB_OUTPUT
           echo "cid=$CID" >> $GITHUB_OUTPUT
       
+      # --- Deep debug: tags, instance profile, SGs, and current SSM managed list
+      - name: Debug EC2 + SSM state
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          SID='${{ steps.ssmwait.outputs.sid }}'
+          CID='${{ steps.ssmwait.outputs.cid }}'
+
+          echo "=== EC2 Describe (server) ==="
+          aws ec2 describe-instances --instance-ids "$SID" \
+            --query "Reservations[0].Instances[0].{ID:InstanceId,State:State.Name,PrivIP:PrivateIpAddress,PubIP:PublicIpAddress,Subnet:SubnetId,Profile:IamInstanceProfile.Arn,SGs:SecurityGroups[*].GroupId,Tags:Tags}" \
+            --output table || true
+
+          echo "=== EC2 Describe (client) ==="
+          aws ec2 describe-instances --instance-ids "$CID" \
+            --query "Reservations[0].Instances[0].{ID:InstanceId,State:State.Name,PrivIP:PrivateIpAddress,PubIP:PublicIpAddress,Subnet:SubnetId,Profile:IamInstanceProfile.Arn,SGs:SecurityGroups[*].GroupId,Tags:Tags}" \
+            --output table || true
+
+          echo "=== IAM Instance Profile Associations ==="
+          aws ec2 describe-iam-instance-profile-associations \
+            --filters "Name=instance-id,Values=$SID,$CID" \
+            --query "IamInstanceProfileAssociations[].{Inst:InstanceId,State:State,ProfileArn:IamInstanceProfile.Arn}" \
+            --output table || true
+
+          echo "=== SSM Managed Instances (PingStatus) ==="
+          aws ssm describe-instance-information \
+            --query "InstanceInformationList[].{ID:InstanceId,Name:Name,Ping:PingStatus,Agent:AgentVersion,Platform:PlatformType,IP:IPAddress}" \
+            --output table || true
+      
       - name: Restart & warm up SSM agents (server & client)
         run: |
           set -euo pipefail
-          SID=${{ steps.ids.outputs.sid }}
-          CID=${{ steps.ids.outputs.cid }}
+          SID=${{ steps.ssmwait.outputs.sid }}
+          CID=${{ steps.ssmwait.outputs.cid }}
 
           restart_agent() {
             local IID="$1"
