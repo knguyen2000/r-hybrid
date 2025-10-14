@@ -82,6 +82,6 @@ jobs:
             results/**/*.csv
             results/**/*.png
 
-      - name: Terraform destroy
+      - name: Terraform destroy (final)
         if: always()
-        run: terraform destroy -auto-approve
+        run: terraform destroy -auto-approve -input=false
