@@ -82,6 +82,10 @@ jobs:
             results/**/*.csv
             results/**/*.png
 
+      - name: Terraform init (for destroy)
+        if: always()
+        run: terraform init -input=false
+
       - name: Terraform destroy (final)
         if: always()
         run: terraform destroy -auto-approve -input=false
