@@ -45,24 +45,6 @@ jobs:
           echo "client=$(terraform output -raw client_public_ip)" >> $GITHUB_OUTPUT
           echo "client_name=$(terraform output -raw client_name_tag)" >> $GITHUB_OUTPUT
           echo "results_bucket=$(terraform output -raw results_bucket_name)" >> $GITHUB_OUTPUT
-      
-      # --- Resolve instance IDs by tag (store as outputs we can reuse)
-      - name: Resolve instance IDs
-        id: ids
-        shell: bash
-        run: |
-          set -euo pipefail
-          SID=$(aws ec2 describe-instances \
-            --filters "Name=tag:Name,Values=network-test-server" "Name=instance-state-name,Values=running" \
-            --query "Reservations[].Instances[].InstanceId" --output text | tr '\t' '\n' | head -n1)
-          CID=$(aws ec2 describe-instances \
-            --filters "Name=tag:Name,Values=${{ steps.tf.outputs.client_name }}" "Name=instance-state-name,Values=running" \
-            --query "Reservations[].Instances[].InstanceId" --output text | tr '\t' '\n' | head -n1)
-
-          echo "SID=$SID"
-          echo "CID=$CID"
-          echo "sid=$SID" >> $GITHUB_OUTPUT
-          echo "cid=$CID" >> $GITHUB_OUTPUT
 
       # --- Deep debug: tags, instance profile, SGs, and current SSM managed list
       - name: Debug EC2 + SSM state
@@ -235,12 +217,11 @@ jobs:
             sleep 5
           done
 
-          # optional: print success logs
           aws s3 cp "s3://${BUCKET}/${OUT_PREFIX}/${CMD_ID}/" ./ssm-prep-logs --recursive || true
           cat ./ssm-prep-logs/*stdout* 2>/dev/null || true
           cat ./ssm-prep-logs/*stderr* 2>/dev/null || true
       
-      - name: Check receiver agent log (optional)
+      - name: Check receiver agent log
         run: |
           aws ssm send-command \
             --instance-ids ${{ steps.ids.outputs.sid }} \
@@ -248,79 +229,79 @@ jobs:
             --parameters '{"commands":["tail -n 5 /var/log/receiver_agent.log || true"]}'
 
       # ---- RUN EXPERIMENTS via SSM (client) ----
-      - name: Run experiments via SSM (by tag)
-        id: run_client
-        run: |
-          BUCKET="${{ steps.tf.outputs.results_bucket }}"
-          PREFIX="${{ env.RESULTS_PREFIX }}"
-          SERVER_IP="${{ steps.tf.outputs.server }}"
-          RESULT_S3_URI="s3://${BUCKET}/${PREFIX}"
-          OUT_PREFIX="${PREFIX}ssm/run-experiments"
+      # - name: Run experiments via SSM (by tag)
+      #   id: run_client
+      #   run: |
+      #     BUCKET="${{ steps.tf.outputs.results_bucket }}"
+      #     PREFIX="${{ env.RESULTS_PREFIX }}"
+      #     SERVER_IP="${{ steps.tf.outputs.server }}"
+      #     RESULT_S3_URI="s3://${BUCKET}/${PREFIX}"
+      #     OUT_PREFIX="${PREFIX}ssm/run-experiments"
 
-          cat > cmd_client.json <<'EOF'
-          {
-            "commands": [
-              "set -euo pipefail\n\n# Helper to retry commands that may fail due to transient issues\nretry() {\n  local n=0\n  local max=5\n  local delay=3\n  until \"$@\"; do\n    n=$((n+1))\n    if [ $n -ge $max ]; then\n      echo \"ERROR: '$*' failed after $n attempts\"\n      exit 1\n    fi\n    echo \"Retry $n/$((max-1)): '$*'\"\n    sleep $((delay*n))\n  done\n}\n\n# Main script logic\necho '==> Cleaning dnf cache...'\nsudo dnf clean all >/dev/null 2>&1 || true\nsudo rm -rf /var/cache/dnf/* || true\n\necho '==> Installing tools with retry...'\nretry sudo dnf -y makecache\nretry sudo dnf -y install --best --allowerasing iperf3 iproute-tc jq sysstat curl awscli\n\necho '==> Downloading experiment script...'\nmkdir -p /home/ec2-user/scripts\naws s3 cp s3://__BUCKET__/__PREFIX__scripts/run_experiments.sh /home/ec2-user/scripts/run_experiments.sh\nchmod +x /home/ec2-user/scripts/run_experiments.sh\n\necho '==> Running experiments...'\nsudo RESULT_S3_URI=__RESULT_S3_URI__ /home/ec2-user/scripts/run_experiments.sh \"__SERVER_IP__\"\n"
-            ]
-          }
-          EOF
+      #     cat > cmd_client.json <<'EOF'
+      #     {
+      #       "commands": [
+      #         "set -euo pipefail\n\n# Helper to retry commands that may fail due to transient issues\nretry() {\n  local n=0\n  local max=5\n  local delay=3\n  until \"$@\"; do\n    n=$((n+1))\n    if [ $n -ge $max ]; then\n      echo \"ERROR: '$*' failed after $n attempts\"\n      exit 1\n    fi\n    echo \"Retry $n/$((max-1)): '$*'\"\n    sleep $((delay*n))\n  done\n}\n\n# Main script logic\necho '==> Cleaning dnf cache...'\nsudo dnf clean all >/dev/null 2>&1 || true\nsudo rm -rf /var/cache/dnf/* || true\n\necho '==> Installing tools with retry...'\nretry sudo dnf -y makecache\nretry sudo dnf -y install --best --allowerasing iperf3 iproute-tc jq sysstat curl awscli\n\necho '==> Downloading experiment script...'\nmkdir -p /home/ec2-user/scripts\naws s3 cp s3://__BUCKET__/__PREFIX__scripts/run_experiments.sh /home/ec2-user/scripts/run_experiments.sh\nchmod +x /home/ec2-user/scripts/run_experiments.sh\n\necho '==> Running experiments...'\nsudo RESULT_S3_URI=__RESULT_S3_URI__ /home/ec2-user/scripts/run_experiments.sh \"__SERVER_IP__\"\n"
+      #       ]
+      #     }
+      #     EOF
 
-          # Use sed to safely substitute placeholders with actual values
-          sed -i "s|__BUCKET__|${BUCKET}|g; s|__PREFIX__|${PREFIX}|g; s|__RESULT_S3_URI__|${RESULT_S3_URI}|g; s|__SERVER_IP__|${SERVER_IP}|g" cmd_client.json
+      #     # Use sed to safely substitute placeholders with actual values
+      #     sed -i "s|__BUCKET__|${BUCKET}|g; s|__PREFIX__|${PREFIX}|g; s|__RESULT_S3_URI__|${RESULT_S3_URI}|g; s|__SERVER_IP__|${SERVER_IP}|g" cmd_client.json
 
-          CMD_ID=$(aws ssm send-command \
-            --targets "Key=tag:Name,Values=${{ steps.tf.outputs.client_name }}" \
-            --document-name "AWS-RunShellScript" \
-            --parameters file://cmd_client.json \
-            --comment "Install tools and run experiments" \
-            --output-s3-bucket-name "$BUCKET" \
-            --output-s3-key-prefix "$OUT_PREFIX" \
-            --cloud-watch-output-config "CloudWatchOutputEnabled=true" \
-            --cli-binary-format raw-in-base64-out \
-            --region ${{ env.AWS_REGION }} \
-            --output json | jq -r '.Command.CommandId')
-          echo "run_cmd_id=$CMD_ID" >> $GITHUB_OUTPUT
+      #     CMD_ID=$(aws ssm send-command \
+      #       --targets "Key=tag:Name,Values=${{ steps.tf.outputs.client_name }}" \
+      #       --document-name "AWS-RunShellScript" \
+      #       --parameters file://cmd_client.json \
+      #       --comment "Install tools and run experiments" \
+      #       --output-s3-bucket-name "$BUCKET" \
+      #       --output-s3-key-prefix "$OUT_PREFIX" \
+      #       --cloud-watch-output-config "CloudWatchOutputEnabled=true" \
+      #       --cli-binary-format raw-in-base64-out \
+      #       --region ${{ env.AWS_REGION }} \
+      #       --output json | jq -r '.Command.CommandId')
+      #     echo "run_cmd_id=$CMD_ID" >> $GITHUB_OUTPUT
 
-          while true; do
-            STATUS=$(aws ssm list-command-invocations \
-              --command-id "$CMD_ID" \
-              --details --query 'CommandInvocations[0].Status' --output text)
-            echo "SSM run status: $STATUS"
-            if [[ "$STATUS" == "Success" ]]; then break; fi
-            if [[ "$STATUS" == "Failed" || "$STATUS" == "Cancelled" || "$STATUS" == "TimedOut" ]]; then
-              echo "Run experiments failed with status: $STATUS"
-              aws s3 cp "s3://${BUCKET}/${OUT_PREFIX}/${CMD_ID}/" ./ssm-run-logs --recursive || true
-              ls -l ./ssm-run-logs || true
-              cat ./ssm-run-logs/*stdout* 2>/dev/null || true
-              cat ./ssm-run-logs/*stderr* 2>/dev/null || true
-              exit 1
-            fi
-            sleep 5
-          done
+      #     while true; do
+      #       STATUS=$(aws ssm list-command-invocations \
+      #         --command-id "$CMD_ID" \
+      #         --details --query 'CommandInvocations[0].Status' --output text)
+      #       echo "SSM run status: $STATUS"
+      #       if [[ "$STATUS" == "Success" ]]; then break; fi
+      #       if [[ "$STATUS" == "Failed" || "$STATUS" == "Cancelled" || "$STATUS" == "TimedOut" ]]; then
+      #         echo "Run experiments failed with status: $STATUS"
+      #         aws s3 cp "s3://${BUCKET}/${OUT_PREFIX}/${CMD_ID}/" ./ssm-run-logs --recursive || true
+      #         ls -l ./ssm-run-logs || true
+      #         cat ./ssm-run-logs/*stdout* 2>/dev/null || true
+      #         cat ./ssm-run-logs/*stderr* 2>/dev/null || true
+      #         exit 1
+      #       fi
+      #       sleep 5
+      #     done
 
-          # optional: print success logs
-          aws s3 cp "s3://${BUCKET}/${OUT_PREFIX}/${CMD_ID}/" ./ssm-run-logs --recursive || true
-          cat ./ssm-run-logs/*stdout* 2>/dev/null || true
-          cat ./ssm-run-logs/*stderr* 2>/dev/null || true
+      #     # optional: print success logs
+      #     aws s3 cp "s3://${BUCKET}/${OUT_PREFIX}/${CMD_ID}/" ./ssm-run-logs --recursive || true
+      #     cat ./ssm-run-logs/*stdout* 2>/dev/null || true
+      #     cat ./ssm-run-logs/*stderr* 2>/dev/null || true
 
-      - name: Download results
-        run: |
-          mkdir -p results
-          aws s3 cp "s3://${{ steps.tf.outputs.results_bucket }}/${{ env.RESULTS_PREFIX }}" results --recursive
+      # - name: Download results
+      #   run: |
+      #     mkdir -p results
+      #     aws s3 cp "s3://${{ steps.tf.outputs.results_bucket }}/${{ env.RESULTS_PREFIX }}" results --recursive
 
-      - name: Analyze results
-        run: |
-          python3 -m pip install matplotlib pandas
-          python3 scripts/analyze_results.py $(ls -t results/net-experiments-*.csv | head -n1)
-          python3 scripts/analyze_switch_stats.py
+      # - name: Analyze results
+      #   run: |
+      #     python3 -m pip install matplotlib pandas
+      #     python3 scripts/analyze_results.py $(ls -t results/net-experiments-*.csv | head -n1)
+      #     python3 scripts/analyze_switch_stats.py
 
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: hybrid-cc-artifacts
-          path: |
-            results/**/*.csv
-            results/**/*.png
+      # - name: Upload artifacts
+      #   uses: actions/upload-artifact@v4
+      #   with:
+      #     name: hybrid-cc-artifacts
+      #     path: |
+      #       results/**/*.csv
+      #       results/**/*.png
 
       - name: Terraform init (for destroy)
         if: always()
