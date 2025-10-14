@@ -1,5 +1,4 @@
 #!/usr/bin/env bash
-# run_experiments.sh — client-side; invoked via SSM
 set -euo pipefail
 
 if [[ $# -lt 1 ]]; then
@@ -135,7 +134,7 @@ run_bundle H2  T2 hybrid 1500 none none "R-Hybrid cross-AZ"
 run_bundle H3  T3 hybrid 1500 none none "R-Hybrid IGW"
 run_bundle H4  T1 hybrid 1500 d50l1p none "R-Hybrid impairments"
 
-echo "✅ Done. CSV at: $CSV"
+echo "Done. CSV at: $CSV"
 
 if [[ -n "${RESULT_S3_URI:-}" ]]; then
   TS=$(date +%Y%m%d-%H%M%S)

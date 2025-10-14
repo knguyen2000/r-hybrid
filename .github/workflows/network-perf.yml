@@ -54,14 +54,120 @@ jobs:
           aws s3 cp scripts/run_experiments.sh "s3://${BUCKET}/${PREFIX}scripts/run_experiments.sh"
           aws s3 cp scripts/receiver_agent.sh "s3://${BUCKET}/${PREFIX}scripts/receiver_agent.sh"
 
-      - name: Prep server
+      # ---- SERVER PREP via SSM (robust install; capture logs to S3) ----
+      - name: Prep server via SSM (by tag)
+        id: prep_server
         run: |
-          # start httpd and iperf3 like before, but also launch receiver agent
-          # on the server in background (SSM send-command)
+          BUCKET="${{ steps.tf.outputs.results_bucket }}"
+          PREFIX="${{ env.RESULTS_PREFIX }}"
+          OUT_PREFIX="${PREFIX}ssm/server-prep"
 
-      - name: Run experiments
+          # Use the consistent __PLACEHOLDER__ convention
+          cat > cmd_server.json <<'EOF'
+          {
+            "commands": [
+              "set -euo pipefail",
+              "aws s3 cp s3://__BUCKET__/__PREFIX__scripts/server_prep.sh /tmp/server_prep.sh",
+              "chmod +x /tmp/server_prep.sh",
+              "sudo /tmp/server_prep.sh"
+            ]
+          }
+          EOF
+
+          # Update sed to match the new, robust placeholders
+          sed -i "s|__BUCKET__|${BUCKET}|g; s|__PREFIX__|${PREFIX}|g" cmd_server.json
+
+          CMD_ID=$(aws ssm send-command \
+            --targets "Key=tag:Name,Values=network-test-server" \
+            --document-name "AWS-RunShellScript" \
+            --parameters file://cmd_server.json \
+            --comment "Prep iperf3+httpd on server" \
+            --output-s3-bucket-name "$BUCKET" \
+            --output-s3-key-prefix "$OUT_PREFIX" \
+            --cloud-watch-output-config "CloudWatchOutputEnabled=true" \
+            --cli-binary-format raw-in-base64-out \
+            --region ${{ env.AWS_REGION }} \
+            --output json | jq -r '.Command.CommandId')
+          echo "cmd_id=$CMD_ID" >> $GITHUB_OUTPUT
+
+          # Wait & show logs on failure
+          while true; do
+            STATUS=$(aws ssm list-command-invocations \
+              --command-id "$CMD_ID" \
+              --details --query 'CommandInvocations[0].Status' --output text)
+            echo "SSM prep status: $STATUS"
+            if [[ "$STATUS" == "Success" ]]; then break; fi
+            if [[ "$STATUS" == "Failed" || "$STATUS" == "Cancelled" || "$STATUS" == "TimedOut" ]]; then
+              echo "Server prep failed with status: $STATUS"
+              aws s3 cp "s3://${BUCKET}/${OUT_PREFIX}/${CMD_ID}/" ./ssm-prep-logs --recursive || true
+              ls -l ./ssm-prep-logs || true
+              cat ./ssm-prep-logs/*stdout* 2>/dev/null || true
+              cat ./ssm-prep-logs/*stderr* 2>/dev/null || true
+              exit 1
+            fi
+            sleep 5
+          done
+
+          # optional: print success logs
+          aws s3 cp "s3://${BUCKET}/${OUT_PREFIX}/${CMD_ID}/" ./ssm-prep-logs --recursive || true
+          cat ./ssm-prep-logs/*stdout* 2>/dev/null || true
+          cat ./ssm-prep-logs/*stderr* 2>/dev/null || true
+
+      # ---- RUN EXPERIMENTS via SSM (client) ----
+      - name: Run experiments via SSM (by tag)
+        id: run_client
         run: |
-          # run client-side experiments (run_experiments.sh)
+          BUCKET="${{ steps.tf.outputs.results_bucket }}"
+          PREFIX="${{ env.RESULTS_PREFIX }}"
+          SERVER_IP="${{ steps.tf.outputs.server }}"
+          RESULT_S3_URI="s3://${BUCKET}/${PREFIX}"
+          OUT_PREFIX="${PREFIX}ssm/run-experiments"
+
+          cat > cmd_client.json <<'EOF'
+          {
+            "commands": [
+              "set -euo pipefail\n\n# Helper to retry commands that may fail due to transient issues\nretry() {\n  local n=0\n  local max=5\n  local delay=3\n  until \"$@\"; do\n    n=$((n+1))\n    if [ $n -ge $max ]; then\n      echo \"ERROR: '$*' failed after $n attempts\"\n      exit 1\n    fi\n    echo \"Retry $n/$((max-1)): '$*'\"\n    sleep $((delay*n))\n  done\n}\n\n# Main script logic\necho '==> Cleaning dnf cache...'\nsudo dnf clean all >/dev/null 2>&1 || true\nsudo rm -rf /var/cache/dnf/* || true\n\necho '==> Installing tools with retry...'\nretry sudo dnf -y makecache\nretry sudo dnf -y install --best --allowerasing iperf3 iproute-tc jq sysstat curl awscli\n\necho '==> Downloading experiment script...'\nmkdir -p /home/ec2-user/scripts\naws s3 cp s3://__BUCKET__/__PREFIX__scripts/run_experiments.sh /home/ec2-user/scripts/run_experiments.sh\nchmod +x /home/ec2-user/scripts/run_experiments.sh\n\necho '==> Running experiments...'\nsudo RESULT_S3_URI=__RESULT_S3_URI__ /home/ec2-user/scripts/run_experiments.sh \"__SERVER_IP__\"\n"
+            ]
+          }
+          EOF
+
+          # Use sed to safely substitute placeholders with actual values
+          sed -i "s|__BUCKET__|${BUCKET}|g; s|__PREFIX__|${PREFIX}|g; s|__RESULT_S3_URI__|${RESULT_S3_URI}|g; s|__SERVER_IP__|${SERVER_IP}|g" cmd_client.json
+
+          CMD_ID=$(aws ssm send-command \
+            --targets "Key=tag:Name,Values=${{ steps.tf.outputs.client_name }}" \
+            --document-name "AWS-RunShellScript" \
+            --parameters file://cmd_client.json \
+            --comment "Install tools and run experiments" \
+            --output-s3-bucket-name "$BUCKET" \
+            --output-s3-key-prefix "$OUT_PREFIX" \
+            --cloud-watch-output-config "CloudWatchOutputEnabled=true" \
+            --cli-binary-format raw-in-base64-out \
+            --region ${{ env.AWS_REGION }} \
+            --output json | jq -r '.Command.CommandId')
+          echo "run_cmd_id=$CMD_ID" >> $GITHUB_OUTPUT
+
+          while true; do
+            STATUS=$(aws ssm list-command-invocations \
+              --command-id "$CMD_ID" \
+              --details --query 'CommandInvocations[0].Status' --output text)
+            echo "SSM run status: $STATUS"
+            if [[ "$STATUS" == "Success" ]]; then break; fi
+            if [[ "$STATUS" == "Failed" || "$STATUS" == "Cancelled" || "$STATUS" == "TimedOut" ]]; then
+              echo "Run experiments failed with status: $STATUS"
+              aws s3 cp "s3://${BUCKET}/${OUT_PREFIX}/${CMD_ID}/" ./ssm-run-logs --recursive || true
+              ls -l ./ssm-run-logs || true
+              cat ./ssm-run-logs/*stdout* 2>/dev/null || true
+              cat ./ssm-run-logs/*stderr* 2>/dev/null || true
+              exit 1
+            fi
+            sleep 5
+          done
+
+          # optional: print success logs
+          aws s3 cp "s3://${BUCKET}/${OUT_PREFIX}/${CMD_ID}/" ./ssm-run-logs --recursive || true
+          cat ./ssm-run-logs/*stdout* 2>/dev/null || true
+          cat ./ssm-run-logs/*stderr* 2>/dev/null || true
 
       - name: Download results
         run: |
