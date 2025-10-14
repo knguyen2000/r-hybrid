@@ -282,6 +282,11 @@ jobs:
           aws s3 cp "s3://${BUCKET}/${OUT_PREFIX}/${CMD_ID}/" ./ssm-run-logs --recursive || true
           cat ./ssm-run-logs/*stdout* 2>/dev/null || true
           cat ./ssm-run-logs/*stderr* 2>/dev/null || true
+      
+      - name: Wait for Server to Recover
+        run: |
+          echo "Waiting 30 seconds for the server's CPU to stabilize after tests..."
+          sleep 30
 
       - name: Collect Server-Side Logs
         if: always()
