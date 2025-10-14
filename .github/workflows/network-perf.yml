@@ -217,11 +217,6 @@ jobs:
         run: |
           mkdir -p results
           aws s3 cp "s3://${{ steps.tf.outputs.results_bucket }}/${{ env.RESULTS_PREFIX }}" results --recursive
-      
-      - name: Debug switch events
-        run: |
-          aws s3 cp "s3://${{ steps.tf.outputs.results_bucket }}/${{ env.RESULTS_PREFIX }}/cc_switch_events.csv" .
-          cat cc_switch_events.csv || true
 
       - name: Analyze results
         run: |
