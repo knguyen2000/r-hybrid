@@ -283,6 +283,22 @@ jobs:
           cat ./ssm-run-logs/*stdout* 2>/dev/null || true
           cat ./ssm-run-logs/*stderr* 2>/dev/null || true
 
+      - name: Collect Server-Side Logs
+        if: always()
+        run: |
+          echo "Telling server to upload its cc_switch_events.csv log..."
+          BUCKET="${{ steps.tf.outputs.results_bucket }}"
+          PREFIX="${{ env.RESULTS_PREFIX }}"
+          SERVER_ID="${{ steps.ssmwait.outputs.sid }}"
+          S3_URI="s3://${BUCKET}/${PREFIX}cc_switch_events_from_server.csv"
+
+          aws ssm send-command \
+            --instance-ids "$SERVER_ID" \
+            --document-name "AWS-RunShellScript" \
+            --comment "Upload the receiver agent's log file from the server" \
+            --parameters "commands=['if [ -f /var/log/cc_switch_events.csv ]; then aws s3 cp /var/log/cc_switch_events.csv ${S3_URI}; else echo Log not found; fi']" \
+            --region ${{ env.AWS_REGION }}
+
       - name: Download results
         run: |
           mkdir -p results
