@@ -103,17 +103,32 @@ jobs:
           ]}
           EOF
           
-          # Replace placeholders in a template
           sed "s|__BUCKET__|${BUCKET}|g; s|__PREFIX__|${PREFIX}|g; s|__TARGET_IP__|${CLIENT_IP}|g; s|__SENDER_ID__|${CLIENT_ID}|g" cmd_server.json > cmd_server_final.json
 
-          echo "--- Sending prep command to Server A ---"
-          aws ssm send-command --instance-ids "${{ steps.ssmwait.outputs.sva_id }}" --document-name "AWS-RunShellScript" --parameters file://cmd_server_final.json --comment "Prep Server A"
-          
-          echo "--- Sending prep command to Server B ---"
-          aws ssm send-command --instance-ids "${{ steps.ssmwait.outputs.svb_id }}" --document-name "AWS-RunShellScript" --parameters file://cmd_server_final.json --comment "Prep Server B"
-          
-          echo "Server prep commands sent. Waiting 90s for packages to install..."
-          sleep 90
+          # Function to send a command and wait for its completion
+          prep_and_wait() {
+            local IID="$1" NAME="$2"
+            echo "--- Sending prep command to $NAME ---"
+            CMD_ID=$(aws ssm send-command --instance-ids "$IID" --document-name "AWS-RunShellScript" --parameters file://cmd_server_final.json --comment "Prep $NAME" --output json | jq -r '.Command.CommandId')
+            
+            echo "Waiting for $NAME prep command ($CMD_ID) to complete..."
+            while true; do
+              STATUS=$(aws ssm list-command-invocations --command-id "$CMD_ID" --details --query 'CommandInvocations[0].Status' --output text)
+              echo "$NAME prep status: $STATUS"
+              if [[ "$STATUS" == "Success" ]]; then break; fi
+              if [[ "$STATUS" == "Failed" || "$STATUS" == "Cancelled" || "$STATUS" == "TimedOut" ]]; then
+                echo "ERROR: Prep for $NAME failed with status: $STATUS"
+                # Add log retrieval here if needed
+                exit 1
+              fi
+              sleep 10
+            done
+            echo "$NAME is ready."
+          }
+
+          # FIX: Execute the prep commands sequentially and wait for each to succeed.
+          prep_and_wait "${{ steps.ssmwait.outputs.sva_id }}" "Server A"
+          prep_and_wait "${{ steps.ssmwait.outputs.svb_id }}" "Server B"
 
       - name: Run experiments via SSM (client)
         id: run_client
@@ -160,10 +175,11 @@ jobs:
               aws s3 sync "s3://${BUCKET}/${OUT_PREFIX}/${CMD_ID}/" ./ssm-run-logs/ || true
               
               echo "--- STDOUT from client ---"
-              cat ./ssm-run-logs/*/*stdout* 2>/dev/null || echo "stdout log not found."
+              find ./ssm-run-logs -name "*stdout*" -exec cat {} + || echo "stdout log not found."
               
               echo "--- STDERR from client ---"
-              cat ./ssm-run-logs/*/*stderr* 2>/dev/null || echo "stderr log not found."
+              find ./ssm-run-logs -name "*stderr*" -exec cat {} + || echo "stderr log not found."
+          
               exit 1
             fi
             sleep 10
