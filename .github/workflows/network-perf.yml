@@ -1,0 +1,79 @@
+name: network-perf
+on:
+  workflow_dispatch: {}
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    env:
+      AWS_REGION: us-east-1
+      RESULTS_PREFIX: net-results/
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.8.5
+
+      - name: Configure AWS (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Terraform init & apply
+        run: |
+          terraform init -input=false
+          terraform apply -auto-approve -input=false
+
+      - name: Read outputs
+        id: tf
+        run: |
+          echo "server=$(terraform output -raw server_private_ip)" >> $GITHUB_OUTPUT
+          echo "client=$(terraform output -raw client_public_ip)" >> $GITHUB_OUTPUT
+          echo "client_name=$(terraform output -raw client_name_tag)" >> $GITHUB_OUTPUT
+          echo "results_bucket=$(terraform output -raw results_bucket_name)" >> $GITHUB_OUTPUT
+
+      - name: Upload scripts
+        run: |
+          BUCKET="${{ steps.tf.outputs.results_bucket }}"
+          PREFIX="${{ env.RESULTS_PREFIX }}"
+          aws s3 cp scripts/server_prep.sh "s3://${BUCKET}/${PREFIX}scripts/server_prep.sh"
+          aws s3 cp scripts/run_experiments.sh "s3://${BUCKET}/${PREFIX}scripts/run_experiments.sh"
+          aws s3 cp scripts/receiver_agent.sh "s3://${BUCKET}/${PREFIX}scripts/receiver_agent.sh"
+
+      - name: Prep server
+        run: |
+          # start httpd and iperf3 like before, but also launch receiver agent
+          # on the server in background (SSM send-command)
+
+      - name: Run experiments
+        run: |
+          # run client-side experiments (run_experiments.sh)
+
+      - name: Download results
+        run: |
+          mkdir -p results
+          aws s3 cp "s3://${{ steps.tf.outputs.results_bucket }}/${{ env.RESULTS_PREFIX }}" results --recursive
+
+      - name: Analyze results
+        run: |
+          python3 -m pip install matplotlib pandas
+          python3 scripts/analyze_results.py $(ls -t results/net-experiments-*.csv | head -n1)
+          python3 scripts/analyze_switch_stats.py
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: hybrid-cc-artifacts
+          path: |
+            results/**/*.csv
+            results/**/*.png
+
+      - name: Terraform destroy
+        if: always()
+        run: terraform destroy -auto-approve
