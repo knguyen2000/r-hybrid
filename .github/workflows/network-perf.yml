@@ -25,6 +25,14 @@ jobs:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
+      - name: Terraform init (pre-clean)
+        continue-on-error: true
+        run: terraform init -input=false
+
+      - name: Terraform destroy (pre-clean)
+        continue-on-error: true
+        run: terraform destroy -auto-approve -input=false
+
       - name: Terraform init & apply
         run: |
           terraform init -input=false
@@ -33,47 +41,210 @@ jobs:
       - name: Read outputs
         id: tf
         run: |
-          echo "server=$(terraform output -raw server_private_ip)" >> $GITHUB_OUTPUT
-          echo "client=$(terraform output -raw client_public_ip)" >> $GITHUB_OUTPUT
-          echo "client_name=$(terraform output -raw client_name_tag)" >> $GITHUB_OUTPUT
+          echo "server=$(terraform output -raw server_private_ip)"       >> $GITHUB_OUTPUT
+          echo "client=$(terraform output -raw client_public_ip)"        >> $GITHUB_OUTPUT
+          echo "client_name=$(terraform output -raw client_name_tag)"    >> $GITHUB_OUTPUT
           echo "results_bucket=$(terraform output -raw results_bucket_name)" >> $GITHUB_OUTPUT
 
-      - name: Upload scripts
+      - name: Wait until SSM is online (server & client)
+        id: ssmwait
+        run: |
+          SID=$(aws ec2 describe-instances \
+            --filters "Name=tag:Name,Values=network-test-server" "Name=instance-state-name,Values=running" \
+            --query "Reservations[].Instances[].InstanceId" --output text | head -n1)
+          CID=$(aws ec2 describe-instances \
+            --filters "Name=tag:Name,Values=${{ steps.tf.outputs.client_name }}" "Name=instance-state-name,Values=running" \
+            --query "Reservations[].Instances[].InstanceId" --output text | head -n1)
+
+          echo "ServerId=$SID  ClientId=$CID"
+
+          wait_ssm() {
+            local IID="$1"
+            echo "Waiting for SSM Managed: $IID"
+            for i in {1..60}; do
+              PING=$(aws ssm describe-instance-information \
+                --query "InstanceInformationList[?InstanceId=='${IID}'].PingStatus" --output text)
+              if [ "$PING" = "Online" ]; then
+                echo "Instance $IID is Online in SSM"
+                return 0
+              fi
+              sleep 5
+            done
+            echo "Timed out waiting for SSM Online: $IID"; exit 1
+          }
+
+          wait_ssm "$SID"
+          wait_ssm "$CID"
+
+          echo "sid=$SID" >> $GITHUB_OUTPUT
+          echo "cid=$CID" >> $GITHUB_OUTPUT
+
+      - name: Upload scripts to S3
         run: |
           BUCKET="${{ steps.tf.outputs.results_bucket }}"
           PREFIX="${{ env.RESULTS_PREFIX }}"
-          aws s3 cp scripts/server_prep.sh "s3://${BUCKET}/${PREFIX}scripts/server_prep.sh"
+          aws s3 cp scripts/server_prep.sh     "s3://${BUCKET}/${PREFIX}scripts/server_prep.sh"
           aws s3 cp scripts/run_experiments.sh "s3://${BUCKET}/${PREFIX}scripts/run_experiments.sh"
-          aws s3 cp scripts/receiver_agent.sh "s3://${BUCKET}/${PREFIX}scripts/receiver_agent.sh"
+          aws s3 cp scripts/rhybrid_agent.sh   "s3://${BUCKET}/${PREFIX}scripts/rhybrid_agent.sh"
+          aws s3 cp scripts/rhybrid_apply.sh   "s3://${BUCKET}/${PREFIX}scripts/rhybrid_apply.sh"
 
-      - name: Prep server
+      - name: Prep server via SSM
+        id: prep_server
         run: |
-          # start httpd and iperf3 like before, but also launch receiver agent
-          # on the server in background (SSM send-command)
+          BUCKET="${{ steps.tf.outputs.results_bucket }}"
+          PREFIX="${{ env.RESULTS_PREFIX }}"
+          OUT_PREFIX="${PREFIX}ssm/server-prep"
 
-      - name: Run experiments
+          cat > cmd_server.json <<'EOF'
+          {
+            "commands": [
+              "set -euo pipefail",
+              "aws s3 cp s3://__BUCKET__/__PREFIX__scripts/server_prep.sh /tmp/server_prep.sh",
+              "chmod +x /tmp/server_prep.sh",
+              "sudo /tmp/server_prep.sh"
+            ]
+          }
+          EOF
+
+          sed -i "s|__BUCKET__|${BUCKET}|g; s|__PREFIX__|${PREFIX}|g" cmd_server.json
+
+          CMD_ID=$(aws ssm send-command \
+            --instance-ids "${{ steps.ssmwait.outputs.sid }}" \
+            --document-name "AWS-RunShellScript" \
+            --parameters file://cmd_server.json \
+            --comment "Prep iperf3+httpd on server" \
+            --output-s3-bucket-name "$BUCKET" \
+            --output-s3-key-prefix "$OUT_PREFIX" \
+            --cloud-watch-output-config "CloudWatchOutputEnabled=true" \
+            --cli-binary-format raw-in-base64-out \
+            --region ${{ env.AWS_REGION }} \
+            --output json | jq -r '.Command.CommandId')
+          echo "cmd_id=$CMD_ID" >> $GITHUB_OUTPUT
+
+          while true; do
+            STATUS=$(aws ssm list-command-invocations \
+              --command-id "$CMD_ID" \
+              --details --query 'CommandInvocations[0].Status' --output text)
+            echo "SSM prep status: $STATUS"
+            if [[ "$STATUS" == "Success" ]]; then break; fi
+            if [[ "$STATUS" == "Failed" || "$STATUS" == "Cancelled" || "$STATUS" == "TimedOut" ]]; then
+              echo "Server prep failed with status: $STATUS"
+              aws s3 cp "s3://${BUCKET}/${OUT_PREFIX}/${CMD_ID}/" ./ssm-prep-logs --recursive || true
+              ls -l ./ssm-prep-logs || true
+              cat ./ssm-prep-logs/*stdout* 2>/dev/null || true
+              cat ./ssm-prep-logs/*stderr* 2>/dev/null || true
+              exit 1
+            fi
+            sleep 5
+          done
+
+          aws s3 cp "s3://${BUCKET}/${OUT_PREFIX}/${CMD_ID}/" ./ssm-prep-logs --recursive || true
+          cat ./ssm-prep-logs/*stdout* 2>/dev/null || true
+          cat ./ssm-prep-logs/*stderr* 2>/dev/null || true
+
+      - name: Prep client for R-Hybrid
         run: |
-          # run client-side experiments (run_experiments.sh)
+          BUCKET="${{ steps.tf.outputs.results_bucket }}"
+          PREFIX="${{ env.RESULTS_PREFIX }}"
+          aws ssm send-command \
+            --instance-ids "${{ steps.ssmwait.outputs.cid }}" \
+            --document-name "AWS-RunShellScript" \
+            --parameters "commands=[
+              \"aws s3 cp s3://${BUCKET}/${PREFIX}scripts/rhybrid_apply.sh /home/ec2-user/scripts/rhybrid_apply.sh\",
+              \"chmod +x /home/ec2-user/scripts/rhybrid_apply.sh\"
+            ]" \
+            --comment "Install R-Hybrid apply script"
 
-      - name: Download results
+      - name: Launch R-Hybrid Agent (receiver)
+        run: |
+          BUCKET="${{ steps.tf.outputs.results_bucket }}"
+          PREFIX="${{ env.RESULTS_PREFIX }}"
+          aws ssm send-command \
+            --instance-ids "${{ steps.ssmwait.outputs.sid }}" \
+            --document-name "AWS-RunShellScript" \
+            --parameters "commands=[
+              \"aws s3 cp s3://${BUCKET}/${PREFIX}scripts/rhybrid_agent.sh /home/ec2-user/scripts/rhybrid_agent.sh\",
+              \"chmod +x /home/ec2-user/scripts/rhybrid_agent.sh\",
+              \"nohup /home/ec2-user/scripts/rhybrid_agent.sh > /var/log/rhybrid_agent.log 2>&1 &\"
+            ]" \
+            --comment "Start R-Hybrid receiver agent"
+
+      - name: Run experiments via SSM (client)
+        id: run_client
+        run: |
+          BUCKET="${{ steps.tf.outputs.results_bucket }}"
+          PREFIX="${{ env.RESULTS_PREFIX }}"
+          SERVER_IP="${{ steps.tf.outputs.server }}"
+          RESULT_S3_URI="s3://${BUCKET}/${PREFIX}"
+          OUT_PREFIX="${PREFIX}ssm/run-experiments"
+
+          cat > cmd_client.json <<'EOF'
+          {
+            "commands": [
+              "set -euo pipefail\n\n# Helper to retry commands that may fail due to transient issues\nretry() {\n  local n=0\n  local max=5\n  local delay=3\n  until \"$@\"; do\n    n=$((n+1))\n    if [ $n -ge $max ]; then\n      echo \"ERROR: '$*' failed after $n attempts\"\n      exit 1\n    fi\n    echo \"Retry $n/$((max-1)): '$*'\"\n    sleep $((delay*n))\n  done\n}\n\n# Main script logic\necho '==> Cleaning dnf cache...'\nsudo dnf clean all >/dev/null 2>&1 || true\nsudo rm -rf /var/cache/dnf/* || true\n\necho '==> Installing tools with retry...'\nretry sudo dnf -y makecache\nretry sudo dnf -y install --best --allowerasing iperf3 iproute-tc jq sysstat curl awscli\n\necho '==> Downloading experiment script...'\nmkdir -p /home/ec2-user/scripts\naws s3 cp s3://__BUCKET__/__PREFIX__scripts/run_experiments.sh /home/ec2-user/scripts/run_experiments.sh\nchmod +x /home/ec2-user/scripts/run_experiments.sh\n\necho '==> Running experiments...'\nsudo RESULT_S3_URI=__RESULT_S3_URI__ /home/ec2-user/scripts/run_experiments.sh \"__SERVER_IP__\"\n"
+            ]
+          }
+          EOF
+
+          sed -i "s|__BUCKET__|${BUCKET}|g; s|__PREFIX__|${PREFIX}|g; s|__RESULT_S3_URI__|${RESULT_S3_URI}|g; s|__SERVER_IP__|${SERVER_IP}|g" cmd_client.json
+
+          CMD_ID=$(aws ssm send-command \
+            --instance-ids "${{ steps.ssmwait.outputs.cid }}" \
+            --document-name "AWS-RunShellScript" \
+            --parameters file://cmd_client.json \
+            --comment "Install tools and run experiments" \
+            --output-s3-bucket-name "$BUCKET" \
+            --output-s3-key-prefix "$OUT_PREFIX" \
+            --cloud-watch-output-config "CloudWatchOutputEnabled=true" \
+            --cli-binary-format raw-in-base64-out \
+            --region ${{ env.AWS_REGION }} \
+            --output json | jq -r '.Command.CommandId')
+          echo "run_cmd_id=$CMD_ID" >> $GITHUB_OUTPUT
+
+          while true; do
+            STATUS=$(aws ssm list-command-invocations \
+              --command-id "$CMD_ID" \
+              --details --query 'CommandInvocations[0].Status' --output text)
+            echo "SSM run status: $STATUS"
+            if [[ "$STATUS" == "Success" ]]; then break; fi
+            if [[ "$STATUS" == "Failed" || "$STATUS" == "Cancelled" || "$STATUS" == "TimedOut" ]]; then
+              echo "Run experiments failed with status: $STATUS"
+              aws s3 cp "s3://${BUCKET}/${OUT_PREFIX}/${CMD_ID}/" ./ssm-run-logs --recursive || true
+              ls -l ./ssm-run-logs || true
+              cat ./ssm-run-logs/*stdout* 2>/dev/null || true
+              cat ./ssm-run-logs/*stderr* 2>/dev/null || true
+              exit 1
+            fi
+            sleep 5
+          done
+
+          aws s3 cp "s3://${BUCKET}/${OUT_PREFIX}/${CMD_ID}/" ./ssm-run-logs --recursive || true
+          cat ./ssm-run-logs/*stdout* 2>/dev/null || true
+          cat ./ssm-run-logs/*stderr* 2>/dev/null || true
+
+      - name: Download latest CSV from S3
         run: |
           mkdir -p results
-          aws s3 cp "s3://${{ steps.tf.outputs.results_bucket }}/${{ env.RESULTS_PREFIX }}" results --recursive
+          aws s3 cp "s3://${{ steps.tf.outputs.results_bucket }}/${{ env.RESULTS_PREFIX }}" ./results \
+            --recursive --exclude "*" --include "net-experiments-*.csv"
+          ls -l results || true
 
-      - name: Analyze results
+      - name: Analyze results → charts
         run: |
-          python3 -m pip install matplotlib pandas
-          python3 scripts/analyze_results.py $(ls -t results/net-experiments-*.csv | head -n1)
-          python3 scripts/analyze_switch_stats.py
+          python3 -m pip install --upgrade pip
+          python3 -m pip install pandas matplotlib
+          CSV=$(ls -t results/net-experiments-*.csv | head -n1)
+          echo "Analyzing $CSV"
+          python3 scripts/analyze_results.py "$CSV"
 
-      - name: Upload artifacts
+      - name: Upload artifacts (CSV + charts)
         uses: actions/upload-artifact@v4
         with:
-          name: hybrid-cc-artifacts
+          name: net-experiments-artifacts
           path: |
-            results/**/*.csv
-            results/**/*.png
+            results/net-experiments-*.csv
+            fig_*.png
 
-      - name: Terraform destroy
+      - name: Terraform destroy (final)
         if: always()
-        run: terraform destroy -auto-approve
+        run: terraform destroy -auto-approve -input=false

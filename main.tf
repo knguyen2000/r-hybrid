@@ -16,9 +16,6 @@ provider "aws" {
   region = var.aws_region
 }
 
-# ---------------------------
-# Core VPC + Networking
-# ---------------------------
 resource "aws_vpc" "main" {
   cidr_block           = "10.0.0.0/16"
   enable_dns_support   = true
@@ -115,9 +112,6 @@ resource "aws_security_group" "allow_tests" {
   tags = { Name = "net-perf-sg" }
 }
 
-# ---------------------------
-# AMI (Amazon Linux 2023)
-# ---------------------------
 data "aws_ami" "al2023" {
   most_recent = true
   owners      = ["amazon"]
@@ -132,9 +126,6 @@ data "aws_ami" "al2023" {
   }
 }
 
-# ---------------------------
-# S3 bucket for results (created by Terraform)
-# ---------------------------
 locals {
   results_bucket_name = "poc-net-results-${random_id.suffix.hex}"
 }
@@ -171,9 +162,6 @@ resource "aws_s3_bucket_versioning" "results" {
   versioning_configuration { status = "Enabled" }
 }
 
-# ---------------------------
-# EC2 Instances (no user-data; SSM bootstrap)
-# ---------------------------
 resource "aws_instance" "server" {
   ami                         = data.aws_ami.al2023.id
   instance_type               = var.instance_type

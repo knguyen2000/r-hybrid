@@ -1,4 +1,3 @@
-#!/usr/bin/env bash
 set -euo pipefail
 
 retry() {  # retry helper: retry CMD up to N times with backoff
@@ -29,3 +28,5 @@ done
 sudo systemctl enable --now httpd
 nohup iperf3 -s -p 5001 >/var/log/iperf3-server.log 2>&1 &
 echo "server_prep: DONE"
+
+sudo sysctl -w net.ipv4.tcp_ecn=1
