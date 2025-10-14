@@ -156,6 +156,14 @@ jobs:
             if [[ "$STATUS" == "Failed" || "$STATUS" == "Cancelled" || "$STATUS" == "TimedOut" ]]; then
               echo "Run experiments failed with status: $STATUS"
               # Error handling logic here
+              echo "--- Retrieving error logs from S3 ---"
+              aws s3 sync "s3://${BUCKET}/${OUT_PREFIX}/${CMD_ID}/" ./ssm-run-logs/ || true
+              
+              echo "--- STDOUT from client ---"
+              cat ./ssm-run-logs/*/*stdout* 2>/dev/null || echo "stdout log not found."
+              
+              echo "--- STDERR from client ---"
+              cat ./ssm-run-logs/*/*stderr* 2>/dev/null || echo "stderr log not found."
               exit 1
             fi
             sleep 10
