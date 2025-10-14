@@ -1,4 +1,4 @@
-name: network-perf-debug
+name: network-perf
 on:
   workflow_dispatch: {}
 
@@ -24,7 +24,7 @@ jobs:
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
-
+      
       - name: Terraform init (pre-clean)
         continue-on-error: true
         run: terraform init -input=false
@@ -46,43 +46,53 @@ jobs:
           echo "client_name=$(terraform output -raw client_name_tag)" >> $GITHUB_OUTPUT
           echo "results_bucket=$(terraform output -raw results_bucket_name)" >> $GITHUB_OUTPUT
 
-      # 🔍 Debug EC2 + SSM state
+      # --- Deep debug: tags, instance profile, SGs, and current SSM managed list
       - name: Debug EC2 + SSM state
         if: always()
         shell: bash
         run: |
           set -euo pipefail
-          SID=$(aws ec2 describe-instances --filters "Name=tag:Name,Values=network-test-server" --query "Reservations[].Instances[].InstanceId" --output text | head -n1)
-          CID=$(aws ec2 describe-instances --filters "Name=tag:Name,Values=${{ steps.tf.outputs.client_name }}" --query "Reservations[].Instances[].InstanceId" --output text | head -n1)
-          echo "SID=$SID CID=$CID"
+          SID='${{ steps.ids.outputs.sid }}'
+          CID='${{ steps.ids.outputs.cid }}'
+
           echo "=== EC2 Describe (server) ==="
-          aws ec2 describe-instances --instance-ids "$SID" --query "Reservations[0].Instances[0]" --output table || true
+          aws ec2 describe-instances --instance-ids "$SID" \
+            --query "Reservations[0].Instances[0].{ID:InstanceId,State:State.Name,PrivIP:PrivateIpAddress,PubIP:PublicIpAddress,Subnet:SubnetId,Profile:IamInstanceProfile.Arn,SGs:SecurityGroups[*].GroupId,Tags:Tags}" \
+            --output table || true
+
           echo "=== EC2 Describe (client) ==="
-          aws ec2 describe-instances --instance-ids "$CID" --query "Reservations[0].Instances[0]" --output table || true
+          aws ec2 describe-instances --instance-ids "$CID" \
+            --query "Reservations[0].Instances[0].{ID:InstanceId,State:State.Name,PrivIP:PrivateIpAddress,PubIP:PublicIpAddress,Subnet:SubnetId,Profile:IamInstanceProfile.Arn,SGs:SecurityGroups[*].GroupId,Tags:Tags}" \
+            --output table || true
+
           echo "=== IAM Instance Profile Associations ==="
           aws ec2 describe-iam-instance-profile-associations \
             --filters "Name=instance-id,Values=$SID,$CID" \
+            --query "IamInstanceProfileAssociations[].{Inst:InstanceId,State:State,ProfileArn:IamInstanceProfile.Arn}" \
             --output table || true
+
           echo "=== SSM Managed Instances (PingStatus) ==="
           aws ssm describe-instance-information \
             --query "InstanceInformationList[].{ID:InstanceId,Name:Name,Ping:PingStatus,Agent:AgentVersion,Platform:PlatformType,IP:IPAddress}" \
             --output table || true
-
+      
       - name: Wait until SSM is online (server & client)
         id: ssmwait
         run: |
+          # Resolve instance IDs by tag
           SID=$(aws ec2 describe-instances \
             --filters "Name=tag:Name,Values=network-test-server" "Name=instance-state-name,Values=running" \
-            --query "Reservations[].Instances[].InstanceId" --output text | head -n1)
+            --query "Reservations[].Instances[].InstanceId" --output text | tr '\t' '\n' | head -n1)
           CID=$(aws ec2 describe-instances \
             --filters "Name=tag:Name,Values=${{ steps.tf.outputs.client_name }}" "Name=instance-state-name,Values=running" \
-            --query "Reservations[].Instances[].InstanceId" --output text | head -n1)
+            --query "Reservations[].Instances[].InstanceId" --output text | tr '\t' '\n' | head -n1)
+
           echo "ServerId=$SID  ClientId=$CID"
 
           wait_ssm() {
             local IID="$1"
             echo "Waiting for SSM Managed: $IID"
-            for i in {1..30}; do
+            for i in {1..60}; do
               PING=$(aws ssm describe-instance-information \
                 --query "InstanceInformationList[?InstanceId=='${IID}'].PingStatus" --output text)
               if [ "$PING" = "Online" ]; then
@@ -91,8 +101,7 @@ jobs:
               fi
               sleep 5
             done
-            echo "Timed out waiting for SSM Online: $IID"
-            exit 1
+            echo "Timed out waiting for SSM Online: $IID"; exit 1
           }
 
           wait_ssm "$SID"
@@ -100,70 +109,197 @@ jobs:
 
           echo "sid=$SID" >> $GITHUB_OUTPUT
           echo "cid=$CID" >> $GITHUB_OUTPUT
-
+      
       - name: Restart & warm up SSM agents (server & client)
         run: |
-          SID=${{ steps.ssmwait.outputs.sid }}
-          CID=${{ steps.ssmwait.outputs.cid }}
+          set -euo pipefail
+          SID=${{ steps.ids.outputs.sid }}
+          CID=${{ steps.ids.outputs.cid }}
+
           restart_agent() {
             local IID="$1"
+            echo "=== Restarting SSM agent on $IID ==="
             CMD_ID=$(aws ssm send-command \
               --instance-ids "$IID" \
               --document-name "AWS-RunShellScript" \
               --parameters '{"commands":["sudo systemctl restart amazon-ssm-agent"]}' \
-              --comment "Restart SSM agent for debugging" \
+              --comment "Restart SSM agent to avoid Pending state" \
               --region ${{ env.AWS_REGION }} \
               --output json | jq -r '.Command.CommandId')
-            aws ssm wait command-executed --command-id "$CMD_ID" --instance-id "$IID" --region ${{ env.AWS_REGION }}
+
+            echo "Waiting for restart command $CMD_ID to complete..."
+            aws ssm wait command-executed \
+              --command-id "$CMD_ID" \
+              --instance-id "$IID" \
+              --region ${{ env.AWS_REGION }}
+
+            echo "=== Waiting for agent to warm up ==="
+            for i in {1..30}; do
+              STATUS=$(aws ssm describe-instance-information \
+                --instance-information-filter-list key=InstanceIds,valueSet=$IID \
+                --query "InstanceInformationList[0].PingStatus" --output text)
+              echo "SSM status for $IID: $STATUS"
+              if [ "$STATUS" = "Online" ]; then
+                echo "$IID SSM agent is warm and responsive."
+                return 0
+              fi
+              sleep 5
+            done
+            echo "$IID SSM agent did not warm up after 150s."
+            exit 1
           }
+
           restart_agent "$SID"
           restart_agent "$CID"
 
-      # 💤 COMMENTED OUT — long-running sections
-      # - name: Upload scripts
-      # - name: Prep server via SSM
-      # - name: Check receiver agent log
-      # - name: Run experiments via SSM (by tag)
-      # - name: Download results
-      # - name: Analyze results
-      # - name: Upload artifacts
-
-      # 🩺 Inspect SSM agent log on failure or manually
-      - name: Inspect SSM Agent Log (Server)
-        if: failure()
+      - name: Upload scripts
         run: |
+          BUCKET="${{ steps.tf.outputs.results_bucket }}"
+          PREFIX="${{ env.RESULTS_PREFIX }}"
+          aws s3 cp scripts/server_prep.sh "s3://${BUCKET}/${PREFIX}scripts/server_prep.sh"
+          aws s3 cp scripts/run_experiments.sh "s3://${BUCKET}/${PREFIX}scripts/run_experiments.sh"
+          aws s3 cp scripts/receiver_agent.sh "s3://${BUCKET}/${PREFIX}scripts/receiver_agent.sh"
+
+      # ---- SERVER PREP via SSM ----
+      - name: Prep server and check agent log via SSM
+        id: prep_server
+        run: |
+          BUCKET="${{ steps.tf.outputs.results_bucket }}"
+          PREFIX="${{ env.RESULTS_PREFIX }}"
+          OUT_PREFIX="${PREFIX}ssm/server-prep"
+          SERVER_IP="${{ steps.tf.outputs.server }}"
+
+          # This JSON payload combines prep, agent launch, and log check
+          cat > cmd_server.json <<'EOF'
+          {
+            "commands": [
+              "set -euo pipefail",
+              "echo '==> Downloading scripts...'",
+              "aws s3 cp s3://__BUCKET__/__PREFIX__scripts/server_prep.sh /tmp/server_prep.sh",
+              "aws s3 cp s3://__BUCKET__/__PREFIX__scripts/receiver_agent.sh /tmp/receiver_agent.sh",
+              "chmod +x /tmp/server_prep.sh /tmp/receiver_agent.sh",
+              "echo '==> Running server prep (installing packages)... This may take a few minutes on a t3.micro.'",
+              "sudo /tmp/server_prep.sh",
+              "echo '==> Server prep finished. Launching receiver agent...'",
+              "nohup sudo /tmp/receiver_agent.sh __SERVER_IP__ > /var/log/receiver_agent.log 2>&1 &",
+              "echo 'Agent launched. Waiting 5s before checking log...'",
+              "sleep 5",
+              "echo '--- Last 10 lines of receiver_agent.log ---'",
+              "tail -n 10 /var/log/receiver_agent.log || echo 'Log file not found or is empty.'"
+            ]
+          }
+          EOF
+
+          sed -i "s|__BUCKET__|${BUCKET}|g; s|__PREFIX__|${PREFIX}|g; s|__SERVER_IP__|${SERVER_IP}|g" cmd_server.json
+
           CMD_ID=$(aws ssm send-command \
             --instance-ids ${{ steps.ssmwait.outputs.sid }} \
             --document-name "AWS-RunShellScript" \
-            --comment "Inspect SSM agent log" \
-            --parameters '{"commands":["sudo tail -n 50 /var/log/amazon/ssm/amazon-ssm-agent.log || true"]}' \
+            --parameters file://cmd_server.json \
+            --comment "Prep server, launch agent, and check log" \
+            --output-s3-bucket-name "$BUCKET" \
+            --output-s3-key-prefix "$OUT_PREFIX" \
+            --cli-binary-format raw-in-base64-out \
             --region ${{ env.AWS_REGION }} \
             --output json | jq -r '.Command.CommandId')
-          aws ssm wait command-executed --command-id "$CMD_ID" --instance-id ${{ steps.ssmwait.outputs.sid }} --region ${{ env.AWS_REGION }}
-          aws ssm get-command-invocation \
-            --command-id "$CMD_ID" \
-            --instance-id ${{ steps.ssmwait.outputs.sid }} \
-            --region ${{ env.AWS_REGION }} \
-            --query 'StandardOutputContent' \
-            --output text
 
-      - name: Inspect SSM Agent Log (Client)
-        if: failure()
+          echo "cmd_id=$CMD_ID" >> $GITHUB_OUTPUT
+          
+          # This loop waits for the single, combined command to finish
+          while true; do
+            STATUS=$(aws ssm list-command-invocations \
+              --command-id "$CMD_ID" \
+              --details --query 'CommandInvocations[0].Status' --output text)
+            echo "SSM prep status: $STATUS"
+            if [[ "$STATUS" == "Success" ]]; then break; fi
+            if [[ "$STATUS" == "Failed" || "$STATUS" == "Cancelled" || "$STATUS" == "TimedOut" ]]; then
+              echo "Server prep failed with status: $STATUS"
+              aws s3 sync "s3://${BUCKET}/${OUT_PREFIX}/${CMD_ID}/" ./ssm-prep-logs || true
+              cat ./ssm-prep-logs/*/*stdout* 2>/dev/null || true
+              cat ./ssm-prep-logs/*/*stderr* 2>/dev/null || true
+              exit 1
+            fi
+            sleep 10
+          done
+
+          echo "Final server prep logs:"
+          aws s3 sync "s3://${BUCKET}/${OUT_PREFIX}/${CMD_ID}/" ./ssm-prep-logs || true
+          cat ./ssm-prep-logs/*/*stdout* 2>/dev/null || true
+
+      # ---- RUN EXPERIMENTS via SSM (client) ----
+      - name: Run experiments via SSM (by tag)
+        id: run_client
         run: |
+          BUCKET="${{ steps.tf.outputs.results_bucket }}"
+          PREFIX="${{ env.RESULTS_PREFIX }}"
+          SERVER_IP="${{ steps.tf.outputs.server }}"
+          RESULT_S3_URI="s3://${BUCKET}/${PREFIX}"
+          OUT_PREFIX="${PREFIX}ssm/run-experiments"
+
+          cat > cmd_client.json <<'EOF'
+          {
+            "commands": [
+              "set -euo pipefail\n\n# Helper to retry commands that may fail due to transient issues\nretry() {\n  local n=0\n  local max=5\n  local delay=3\n  until \"$@\"; do\n    n=$((n+1))\n    if [ $n -ge $max ]; then\n      echo \"ERROR: '$*' failed after $n attempts\"\n      exit 1\n    fi\n    echo \"Retry $n/$((max-1)): '$*'\"\n    sleep $((delay*n))\n  done\n}\n\n# Main script logic\necho '==> Cleaning dnf cache...'\nsudo dnf clean all >/dev/null 2>&1 || true\nsudo rm -rf /var/cache/dnf/* || true\n\necho '==> Installing tools with retry...'\nretry sudo dnf -y makecache\nretry sudo dnf -y install --best --allowerasing iperf3 iproute-tc jq sysstat curl awscli\n\necho '==> Downloading experiment script...'\nmkdir -p /home/ec2-user/scripts\naws s3 cp s3://__BUCKET__/__PREFIX__scripts/run_experiments.sh /home/ec2-user/scripts/run_experiments.sh\nchmod +x /home/ec2-user/scripts/run_experiments.sh\n\necho '==> Running experiments...'\nsudo RESULT_S3_URI=__RESULT_S3_URI__ /home/ec2-user/scripts/run_experiments.sh \"__SERVER_IP__\"\n"
+            ]
+          }
+          EOF
+
+          # Use sed to safely substitute placeholders with actual values
+          sed -i "s|__BUCKET__|${BUCKET}|g; s|__PREFIX__|${PREFIX}|g; s|__RESULT_S3_URI__|${RESULT_S3_URI}|g; s|__SERVER_IP__|${SERVER_IP}|g" cmd_client.json
+
           CMD_ID=$(aws ssm send-command \
-            --instance-ids ${{ steps.ssmwait.outputs.cid }} \
+            --targets "Key=tag:Name,Values=${{ steps.tf.outputs.client_name }}" \
             --document-name "AWS-RunShellScript" \
-            --comment "Inspect SSM agent log" \
-            --parameters '{"commands":["sudo tail -n 50 /var/log/amazon/ssm/amazon-ssm-agent.log || true"]}' \
+            --parameters file://cmd_client.json \
+            --comment "Install tools and run experiments" \
+            --output-s3-bucket-name "$BUCKET" \
+            --output-s3-key-prefix "$OUT_PREFIX" \
+            --cloud-watch-output-config "CloudWatchOutputEnabled=true" \
+            --cli-binary-format raw-in-base64-out \
             --region ${{ env.AWS_REGION }} \
             --output json | jq -r '.Command.CommandId')
-          aws ssm wait command-executed --command-id "$CMD_ID" --instance-id ${{ steps.ssmwait.outputs.cid }} --region ${{ env.AWS_REGION }}
-          aws ssm get-command-invocation \
-            --command-id "$CMD_ID" \
-            --instance-id ${{ steps.ssmwait.outputs.cid }} \
-            --region ${{ env.AWS_REGION }} \
-            --query 'StandardOutputContent' \
-            --output text
+          echo "run_cmd_id=$CMD_ID" >> $GITHUB_OUTPUT
+
+          while true; do
+            STATUS=$(aws ssm list-command-invocations \
+              --command-id "$CMD_ID" \
+              --details --query 'CommandInvocations[0].Status' --output text)
+            echo "SSM run status: $STATUS"
+            if [[ "$STATUS" == "Success" ]]; then break; fi
+            if [[ "$STATUS" == "Failed" || "$STATUS" == "Cancelled" || "$STATUS" == "TimedOut" ]]; then
+              echo "Run experiments failed with status: $STATUS"
+              aws s3 cp "s3://${BUCKET}/${OUT_PREFIX}/${CMD_ID}/" ./ssm-run-logs --recursive || true
+              ls -l ./ssm-run-logs || true
+              cat ./ssm-run-logs/*stdout* 2>/dev/null || true
+              cat ./ssm-run-logs/*stderr* 2>/dev/null || true
+              exit 1
+            fi
+            sleep 5
+          done
+
+          # print success logs
+          aws s3 cp "s3://${BUCKET}/${OUT_PREFIX}/${CMD_ID}/" ./ssm-run-logs --recursive || true
+          cat ./ssm-run-logs/*stdout* 2>/dev/null || true
+          cat ./ssm-run-logs/*stderr* 2>/dev/null || true
+
+      - name: Download results
+        run: |
+          mkdir -p results
+          aws s3 cp "s3://${{ steps.tf.outputs.results_bucket }}/${{ env.RESULTS_PREFIX }}" results --recursive
+
+      - name: Analyze results
+        run: |
+          python3 -m pip install matplotlib pandas
+          python3 scripts/analyze_results.py $(ls -t results/net-experiments-*.csv | head -n1)
+          python3 scripts/analyze_switch_stats.py
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: hybrid-cc-artifacts
+          path: |
+            results/**/*.csv
+            results/**/*.png
 
       - name: Terraform init (for destroy)
         if: always()
