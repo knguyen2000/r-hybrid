@@ -45,6 +45,40 @@ jobs:
           echo "client=$(terraform output -raw client_public_ip)" >> $GITHUB_OUTPUT
           echo "client_name=$(terraform output -raw client_name_tag)" >> $GITHUB_OUTPUT
           echo "results_bucket=$(terraform output -raw results_bucket_name)" >> $GITHUB_OUTPUT
+      
+      - name: Wait until SSM is online (server & client)
+        id: ssmwait
+        run: |
+          # Resolve instance IDs by tag
+          SID=$(aws ec2 describe-instances \
+            --filters "Name=tag:Name,Values=network-test-server" "Name=instance-state-name,Values=running" \
+            --query "Reservations[].Instances[].InstanceId" --output text | tr '\t' '\n' | head -n1)
+          CID=$(aws ec2 describe-instances \
+            --filters "Name=tag:Name,Values=${{ steps.tf.outputs.client_name }}" "Name=instance-state-name,Values=running" \
+            --query "Reservations[].Instances[].InstanceId" --output text | tr '\t' '\n' | head -n1)
+
+          echo "ServerId=$SID  ClientId=$CID"
+
+          wait_ssm() {
+            local IID="$1"
+            echo "Waiting for SSM Managed: $IID"
+            for i in {1..60}; do
+              PING=$(aws ssm describe-instance-information \
+                --query "InstanceInformationList[?InstanceId=='${IID}'].PingStatus" --output text)
+              if [ "$PING" = "Online" ]; then
+                echo "Instance $IID is Online in SSM"
+                return 0
+              fi
+              sleep 5
+            done
+            echo "Timed out waiting for SSM Online: $IID"; exit 1
+          }
+
+          wait_ssm "$SID"
+          wait_ssm "$CID"
+
+          echo "sid=$SID" >> $GITHUB_OUTPUT
+          echo "cid=$CID" >> $GITHUB_OUTPUT
 
       - name: Upload scripts
         run: |
@@ -115,6 +149,13 @@ jobs:
           aws s3 cp "s3://${BUCKET}/${OUT_PREFIX}/${CMD_ID}/" ./ssm-prep-logs --recursive || true
           cat ./ssm-prep-logs/*stdout* 2>/dev/null || true
           cat ./ssm-prep-logs/*stderr* 2>/dev/null || true
+      
+      - name: Check receiver agent log (optional)
+        run: |
+          aws ssm send-command \
+            --targets "Key=tag:Name,Values=network-test-server" \
+            --document-name "AWS-RunShellScript" \
+            --parameters '{"commands":["tail -n 5 /var/log/receiver_agent.log || true"]}'
 
       # ---- RUN EXPERIMENTS via SSM (client) ----
       - name: Run experiments via SSM (by tag)
@@ -176,6 +217,11 @@ jobs:
         run: |
           mkdir -p results
           aws s3 cp "s3://${{ steps.tf.outputs.results_bucket }}/${{ env.RESULTS_PREFIX }}" results --recursive
+      
+      - name: Debug switch events
+        run: |
+          aws s3 cp "s3://${{ steps.tf.outputs.results_bucket }}/${{ env.RESULTS_PREFIX }}/cc_switch_events.csv" .
+          cat cc_switch_events.csv || true
 
       - name: Analyze results
         run: |
