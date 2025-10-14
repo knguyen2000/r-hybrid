@@ -127,6 +127,48 @@ jobs:
 
           echo "sid=$SID" >> $GITHUB_OUTPUT
           echo "cid=$CID" >> $GITHUB_OUTPUT
+      
+      - name: Restart & warm up SSM agents (server & client)
+        run: |
+          set -euo pipefail
+          SID=${{ steps.ids.outputs.sid }}
+          CID=${{ steps.ids.outputs.cid }}
+
+          restart_agent() {
+            local IID="$1"
+            echo "=== Restarting SSM agent on $IID ==="
+            CMD_ID=$(aws ssm send-command \
+              --instance-ids "$IID" \
+              --document-name "AWS-RunShellScript" \
+              --parameters '{"commands":["sudo systemctl restart amazon-ssm-agent"]}' \
+              --comment "Restart SSM agent to avoid Pending state" \
+              --region ${{ env.AWS_REGION }} \
+              --output json | jq -r '.Command.CommandId')
+
+            echo "Waiting for restart command $CMD_ID to complete..."
+            aws ssm wait command-executed \
+              --command-id "$CMD_ID" \
+              --instance-id "$IID" \
+              --region ${{ env.AWS_REGION }}
+
+            echo "=== Waiting for agent to warm up ==="
+            for i in {1..30}; do
+              STATUS=$(aws ssm describe-instance-information \
+                --instance-information-filter-list key=InstanceIds,valueSet=$IID \
+                --query "InstanceInformationList[0].PingStatus" --output text)
+              echo "SSM status for $IID: $STATUS"
+              if [ "$STATUS" = "Online" ]; then
+                echo "$IID SSM agent is warm and responsive."
+                return 0
+              fi
+              sleep 5
+            done
+            echo "$IID SSM agent did not warm up after 150s."
+            exit 1
+          }
+
+          restart_agent "$SID"
+          restart_agent "$CID"
 
       - name: Upload scripts
         run: |
