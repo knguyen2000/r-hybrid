@@ -1,230 +1,62 @@
-name: network-perf
+name: Network Perf Experiment
+
 on:
-  workflow_dispatch: {}
+  workflow_dispatch:
 
 jobs:
-  run:
+  run-experiments:
     runs-on: ubuntu-latest
-    permissions:
-      id-token: write
-      contents: read
-    env:
-      AWS_REGION: us-east-1
-      RESULTS_PREFIX: net-results/
-
     steps:
-      - uses: actions/checkout@v4
+    - uses: actions/checkout@v4
 
-      - uses: hashicorp/setup-terraform@v3
-        with:
-          terraform_version: 1.8.5
+    - name: Set up Terraform
+      uses: hashicorp/setup-terraform@v3
+      with:
+        terraform_version: 1.5.0
 
-      - name: Configure AWS (OIDC)
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
-          aws-region: ${{ env.AWS_REGION }}
-      
-      - name: Terraform destroy (pre-clean)
-        continue-on-error: true
-        run: terraform destroy -auto-approve -input=false
+    - name: Terraform Init & Apply
+      working-directory: terraform
+      run: |
+        terraform init
+        terraform apply -auto-approve
 
-      - name: Terraform init & apply
-        run: |
-          terraform init -input=false
-          terraform apply -auto-approve -input=false
+    - name: Fetch outputs
+      id: tf
+      working-directory: terraform
+      run: |
+        SERVER_IP=$(terraform output -raw server_ip)
+        S3_BUCKET_NAME=$(terraform output -raw s3_bucket_name)
+        echo "SERVER_IP=$SERVER_IP" >> $GITHUB_ENV
+        echo "S3_BUCKET_NAME=$S3_BUCKET_NAME" >> $GITHUB_ENV
 
-      - name: Read outputs
-        id: tf
-        run: |
-          echo "server_a_ip=$(terraform output -raw server_a_private_ip)" >> $GITHUB_OUTPUT
-          echo "server_b_ip=$(terraform output -raw server_b_private_ip)" >> $GITHUB_OUTPUT
-          echo "client_id=$(terraform output -raw client_instance_id)" >> $GITHUB_OUTPUT
-          echo "client_ip=$(terraform output -raw client_private_ip)" >> $GITHUB_OUTPUT
-          echo "client_name=$(terraform output -raw client_name_tag)" >> $GITHUB_OUTPUT
-          echo "results_bucket=$(terraform output -raw results_bucket_name)" >> $GITHUB_OUTPUT
+    - name: Prep Server
+      run: |
+        aws ssm send-command \
+          --targets "Key=tag:Name,Values=network-test-server" \
+          --document-name "AWS-RunShellScript" \
+          --parameters commands="bash /home/ec2-user/scripts/server_prep.sh"
 
-      - name: Wait until SSM is online (all instances)
-        id: ssmwait
-        run: |
-          # Get server IDs by tag lookup
-          SVR_A_ID=$(aws ec2 describe-instances --filters "Name=tag:Name,Values=network-test-server-a" "Name=instance-state-name,Values=running" --query "Reservations[].Instances[].InstanceId" --output text)
-          SVR_B_ID=$(aws ec2 describe-instances --filters "Name=tag:Name,Values=network-test-server-b" "Name=instance-state-name,Values=running" --query "Reservations[].Instances[].InstanceId" --output text)
-          CLIENT_ID="${{ steps.tf.outputs.client_id }}"
+    - name: Start Receiver Agent
+      run: |
+        aws ssm send-command \
+          --targets "Key=tag:Name,Values=network-test-client-1" \
+          --document-name "AWS-RunShellScript" \
+          --parameters commands="nohup bash /home/ec2-user/scripts/receiver_agent.sh $SERVER_IP &"
 
-          echo "ServerA_Id=$SVR_A_ID  ServerB_Id=$SVR_B_ID  ClientId=$CLIENT_ID"
+    - name: Run Experiments
+      run: |
+        aws ssm send-command \
+          --targets "Key=tag:Name,Values=network-test-client-1" \
+          --document-name "AWS-RunShellScript" \
+          --parameters commands="S3_BUCKET=${S3_BUCKET_NAME} bash /home/ec2-user/scripts/run_experiments.sh $SERVER_IP"
 
-          wait_ssm() {
-            local IID="$1" NAME="$2"
-            echo "Waiting for SSM Managed: $NAME ($IID)"
-            for i in {1..60}; do
-              PING=$(aws ssm describe-instance-information --query "InstanceInformationList[?InstanceId=='${IID}'].PingStatus" --output text)
-              if [ "$PING" = "Online" ]; then
-                echo "Instance $NAME ($IID) is Online in SSM"
-                return 0
-              fi
-              sleep 5
-            done
-            echo "Timed out waiting for SSM Online: $NAME ($IID)"; exit 1
-          }
+    - name: Download results from S3
+      run: |
+        mkdir -p results
+        aws s3 cp "s3://${S3_BUCKET_NAME}/results/" ./results --recursive
+        ls -R results
 
-          wait_ssm "$SVR_A_ID" "ServerA"
-          wait_ssm "$SVR_B_ID" "ServerB"
-          wait_ssm "$CLIENT_ID" "Client"
-
-          echo "sva_id=$SVR_A_ID" >> $GITHUB_OUTPUT
-          echo "svb_id=$SVR_B_ID" >> $GITHUB_OUTPUT
-
-      - name: Upload scripts to S3
-        run: |
-          BUCKET="${{ steps.tf.outputs.results_bucket }}"
-          PREFIX="${{ env.RESULTS_PREFIX }}"
-          aws s3 cp scripts/server_prep.sh "s3://${BUCKET}/${PREFIX}scripts/server_prep.sh"
-          aws s3 cp scripts/run_experiments.sh "s3://${BUCKET}/${PREFIX}scripts/run_experiments.sh"
-          aws s3 cp scripts/receiver_agent.sh "s3://${BUCKET}/${PREFIX}scripts/receiver_agent.sh"
-
-      - name: Prep servers and launch agents via SSM
-        run: |
-          BUCKET="${{ steps.tf.outputs.results_bucket }}"
-          PREFIX="${{ env.RESULTS_PREFIX }}"
-          CLIENT_IP="${{ steps.tf.outputs.client_ip }}"
-          CLIENT_ID="${{ steps.tf.outputs.client_id }}"
-          
-          cat > cmd_server.json <<'EOF'
-          { "commands": [
-              "set -euo pipefail",
-              "aws s3 cp s3://__BUCKET__/__PREFIX__scripts/server_prep.sh /tmp/server_prep.sh",
-              "aws s3 cp s3://__BUCKET__/__PREFIX__scripts/receiver_agent.sh /tmp/receiver_agent.sh",
-              "chmod +x /tmp/*.sh",
-              "echo '==> Running server prep (installing packages)...'",
-              "sudo /tmp/server_prep.sh",
-              "echo '==> Launching receiver agent...'",
-              "nohup sudo /tmp/receiver_agent.sh __TARGET_IP__ __SENDER_ID__ > /var/log/receiver_agent.log 2>&1 &"
-          ]}
-          EOF
-          
-          sed "s|__BUCKET__|${BUCKET}|g; s|__PREFIX__|${PREFIX}|g; s|__TARGET_IP__|${CLIENT_IP}|g; s|__SENDER_ID__|${CLIENT_ID}|g" cmd_server.json > cmd_server_final.json
-
-          # Function to send a command and wait for its completion
-          prep_and_wait() {
-            local IID="$1" NAME="$2"
-            echo "--- Sending prep command to $NAME ---"
-            CMD_ID=$(aws ssm send-command --instance-ids "$IID" --document-name "AWS-RunShellScript" --parameters file://cmd_server_final.json --comment "Prep $NAME" --output json | jq -r '.Command.CommandId')
-            
-            echo "Waiting for $NAME prep command ($CMD_ID) to complete..."
-            while true; do
-              STATUS=$(aws ssm list-command-invocations --command-id "$CMD_ID" --details --query 'CommandInvocations[0].Status' --output text)
-              echo "$NAME prep status: $STATUS"
-              if [[ "$STATUS" == "Success" ]]; then break; fi
-              if [[ "$STATUS" == "Failed" || "$STATUS" == "Cancelled" || "$STATUS" == "TimedOut" ]]; then
-                echo "ERROR: Prep for $NAME failed with status: $STATUS"
-                # Add log retrieval here if needed
-                exit 1
-              fi
-              sleep 10
-            done
-            echo "$NAME is ready."
-          }
-
-          # FIX: Execute the prep commands sequentially and wait for each to succeed.
-          prep_and_wait "${{ steps.ssmwait.outputs.sva_id }}" "Server A"
-          prep_and_wait "${{ steps.ssmwait.outputs.svb_id }}" "Server B"
-
-      - name: Run experiments via SSM (client)
-        id: run_client
-        run: |
-          BUCKET="${{ steps.tf.outputs.results_bucket }}"
-          PREFIX="${{ env.RESULTS_PREFIX }}"
-          SERVER_A_IP="${{ steps.tf.outputs.server_a_ip }}"
-          SERVER_B_IP="${{ steps.tf.outputs.server_b_ip }}"
-          CLIENT_ID="${{ steps.tf.outputs.client_id }}"
-          RESULT_S3_URI="s3://${BUCKET}/${PREFIX}"
-          OUT_PREFIX="${PREFIX}ssm/run-experiments"
-
-          COMMANDS="[ \
-            \"set -euo pipefail\", \
-            \"echo '==> Installing client tools...'\", \
-            \"sudo dnf -y install --allowerasing iperf3 iproute-tc jq sysstat curl awscli bc\", \
-            \"echo '==> Downloading experiment script...'\", \
-            \"aws s3 cp s3://${BUCKET}/${PREFIX}scripts/run_experiments.sh /tmp/run_experiments.sh\", \
-            \"chmod +x /tmp/run_experiments.sh\", \
-            \"echo '==> Running experiments...'\", \
-            \"sudo RESULT_S3_URI=${RESULT_S3_URI} /tmp/run_experiments.sh \\\"${SERVER_A_IP}\\\" \\\"${SERVER_B_IP}\\\"\" \
-          ]"
-
-          CMD_ID=$(aws ssm send-command \
-            --instance-ids "$CLIENT_ID" \
-            --document-name "AWS-RunShellScript" \
-            --parameters "{\"commands\":$COMMANDS}" \
-            --comment "Run multi-topology experiments from client" \
-            --output-s3-bucket-name "$BUCKET" \
-            --output-s3-key-prefix "$OUT_PREFIX" \
-            --cli-binary-format raw-in-base64-out \
-            --output json | jq -r '.Command.CommandId')
-          
-          echo "run_cmd_id=$CMD_ID" >> $GITHUB_OUTPUT
-
-          while true; do
-            STATUS=$(aws ssm list-command-invocations --command-id "$CMD_ID" --details --query 'CommandInvocations[0].Status' --output text)
-            echo "SSM run status: $STATUS"
-            if [[ "$STATUS" == "Success" ]]; then break; fi
-            if [[ "$STATUS" == "Failed" || "$STATUS" == "Cancelled" || "$STATUS" == "TimedOut" ]]; then
-              echo "Run experiments failed with status: $STATUS"
-              # Error handling logic here
-              echo "--- Retrieving error logs from S3 ---"
-              aws s3 sync "s3://${BUCKET}/${OUT_PREFIX}/${CMD_ID}/" ./ssm-run-logs/ || true
-              
-              echo "--- STDOUT from client ---"
-              find ./ssm-run-logs -name "*stdout*" -exec cat {} + || echo "stdout log not found."
-              
-              echo "--- STDERR from client ---"
-              find ./ssm-run-logs -name "*stderr*" -exec cat {} + || echo "stderr log not found."
-          
-              exit 1
-            fi
-            sleep 10
-          done
-
-      - name: Collect Final Server Logs
-        if: always()
-        run: |
-          echo "Waiting 30s for servers to cool down before collecting logs..."
-          sleep 30
-          BUCKET="${{ steps.tf.outputs.results_bucket }}"
-          PREFIX="${{ env.RESULTS_PREFIX }}"
-          
-          upload_logs() {
-            local IID="$1" NAME="$2"
-            echo "Telling $NAME to upload its logs..."
-            S3_URI_CSV="s3://${BUCKET}/${PREFIX}cc_switch_events_${NAME}.csv"
-            S3_URI_LOG="s3://${BUCKET}/${PREFIX}receiver_agent_${NAME}.log"
-            
-            # FIX: Replaced single quotes (') with escaped double quotes (\")
-            # to create a valid JSON array of strings.
-            COMMANDS="[ \
-              \"if [ -f /var/log/cc_switch_events.csv ]; then aws s3 cp /var/log/cc_switch_events.csv ${S3_URI_CSV}; fi\", \
-              \"if [ -f /var/log/receiver_agent.log ]; then aws s3 cp /var/log/receiver_agent.log ${S3_URI_LOG}; fi\" \
-            ]"
-            
-            aws ssm send-command --instance-ids "$IID" --document-name "AWS-RunShellScript" --parameters "{\"commands\":$COMMANDS}"
-          }
-          
-          upload_logs "${{ steps.ssmwait.outputs.sva_id }}" "server_a"
-          upload_logs "${{ steps.ssmwait.outputs.svb_id }}" "server_b"
-
-      - name: Download and Analyze Results
-        run: |
-          mkdir -p results
-          aws s3 cp "s3://${{ steps.tf.outputs.results_bucket }}/${{ env.RESULTS_PREFIX }}" results --recursive
-          # Your python analysis scripts here...
-          ls -R results
-
-      - name: Upload Artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: network-experiment-artifacts
-          path: results/
-
-      - name: Terraform Destroy
-        if: always()
-        run: terraform destroy -auto-approve -input=false
+    - name: Analyze
+      run: |
+        pip install pandas matplotlib
+        python analysis/analyze_results.py
