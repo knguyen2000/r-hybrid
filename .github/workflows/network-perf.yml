@@ -61,33 +61,36 @@ jobs:
           BUCKET="${{ steps.tf.outputs.results_bucket }}"
           PREFIX="${{ env.RESULTS_PREFIX }}"
           OUT_PREFIX="${PREFIX}ssm/server-prep"
+          SERVER_IP="${{ steps.tf.outputs.server }}"
 
-          # Use the consistent __PLACEHOLDER__ convention
           cat > cmd_server.json <<'EOF'
           {
             "commands": [
               "set -euo pipefail",
               "aws s3 cp s3://__BUCKET__/__PREFIX__scripts/server_prep.sh /tmp/server_prep.sh",
-              "chmod +x /tmp/server_prep.sh",
-              "sudo /tmp/server_prep.sh"
+              "aws s3 cp s3://__BUCKET__/__PREFIX__scripts/receiver_agent.sh /tmp/receiver_agent.sh",
+              "chmod +x /tmp/server_prep.sh /tmp/receiver_agent.sh",
+              "sudo /tmp/server_prep.sh",
+              "nohup sudo /tmp/receiver_agent.sh __SERVER_IP__ > /var/log/receiver_agent.log 2>&1 &",
+              "echo 'Receiver agent launched with SERVER_IP=__SERVER_IP__'"
             ]
           }
           EOF
 
-          # Update sed to match the new, robust placeholders
-          sed -i "s|__BUCKET__|${BUCKET}|g; s|__PREFIX__|${PREFIX}|g" cmd_server.json
+          sed -i "s|__BUCKET__|${BUCKET}|g; s|__PREFIX__|${PREFIX}|g; s|__SERVER_IP__|${SERVER_IP}|g" cmd_server.json
 
           CMD_ID=$(aws ssm send-command \
             --targets "Key=tag:Name,Values=network-test-server" \
             --document-name "AWS-RunShellScript" \
             --parameters file://cmd_server.json \
-            --comment "Prep iperf3+httpd on server" \
+            --comment "Prep iperf3+httpd and receiver agent on server" \
             --output-s3-bucket-name "$BUCKET" \
             --output-s3-key-prefix "$OUT_PREFIX" \
             --cloud-watch-output-config "CloudWatchOutputEnabled=true" \
             --cli-binary-format raw-in-base64-out \
             --region ${{ env.AWS_REGION }} \
             --output json | jq -r '.Command.CommandId')
+
           echo "cmd_id=$CMD_ID" >> $GITHUB_OUTPUT
 
           # Wait & show logs on failure
