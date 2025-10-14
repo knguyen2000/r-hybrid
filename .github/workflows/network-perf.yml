@@ -162,7 +162,7 @@ jobs:
           sed -i "s|__BUCKET__|${BUCKET}|g; s|__PREFIX__|${PREFIX}|g; s|__SERVER_IP__|${SERVER_IP}|g" cmd_server.json
 
           CMD_ID=$(aws ssm send-command \
-            --targets "Key=InstanceIds,Values=${{ steps.ids.outputs.sid }}" \
+            --instance-ids ${{ steps.ids.outputs.sid }} \
             --document-name "AWS-RunShellScript" \
             --parameters file://cmd_server.json \
             --comment "Prep iperf3+httpd and receiver agent on server" \
@@ -201,7 +201,7 @@ jobs:
       - name: Check receiver agent log (optional)
         run: |
           aws ssm send-command \
-            --targets "Key=InstanceIds,Values=${{ steps.ids.outputs.sid }}" \
+            --instance-ids ${{ steps.ids.outputs.sid }} \
             --document-name "AWS-RunShellScript" \
             --parameters '{"commands":["tail -n 5 /var/log/receiver_agent.log || true"]}'
 
