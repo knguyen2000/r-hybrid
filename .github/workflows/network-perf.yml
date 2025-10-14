@@ -144,7 +144,7 @@ jobs:
           COMMANDS="[ \
             \"set -euo pipefail\", \
             \"echo '==> Installing client tools...'\", \
-            \"sudo dnf -y install iperf3 iproute-tc jq sysstat curl awscli bc\", \
+            \"sudo dnf -y install --allowerasing iperf3 iproute-tc jq sysstat curl awscli bc\", \
             \"echo '==> Downloading experiment script...'\", \
             \"aws s3 cp s3://${BUCKET}/${PREFIX}scripts/run_experiments.sh /tmp/run_experiments.sh\", \
             \"chmod +x /tmp/run_experiments.sh\", \
