@@ -25,7 +25,7 @@ jobs:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
-      # ---- PRE-CLEAN to avoid collisions across runs ----
+      # ---- PRE-CLEAN to avoid collisions ----
       - name: Terraform init (pre-clean)
         continue-on-error: true
         run: terraform init -input=false
@@ -34,7 +34,7 @@ jobs:
         continue-on-error: true
         run: terraform destroy -auto-approve -input=false
 
-      # ---- CREATE ----
+      # ---- CREATE INFRA ----
       - name: Terraform init & apply
         run: |
           terraform init -input=false
@@ -48,16 +48,16 @@ jobs:
           echo "client_name=$(terraform output -raw client_name_tag)"    >> $GITHUB_OUTPUT
           echo "results_bucket=$(terraform output -raw results_bucket_name)" >> $GITHUB_OUTPUT
 
+      # ---- WAIT FOR SSM ONLINE ----
       - name: Wait until SSM is online (server & client)
         id: ssmwait
         run: |
-          # Resolve instance IDs by tag
           SID=$(aws ec2 describe-instances \
             --filters "Name=tag:Name,Values=network-test-server" "Name=instance-state-name,Values=running" \
-            --query "Reservations[].Instances[].InstanceId" --output text | tr '\t' '\n' | head -n1)
+            --query "Reservations[].Instances[].InstanceId" --output text | head -n1)
           CID=$(aws ec2 describe-instances \
             --filters "Name=tag:Name,Values=${{ steps.tf.outputs.client_name }}" "Name=instance-state-name,Values=running" \
-            --query "Reservations[].Instances[].InstanceId" --output text | tr '\t' '\n' | head -n1)
+            --query "Reservations[].Instances[].InstanceId" --output text | head -n1)
 
           echo "ServerId=$SID  ClientId=$CID"
 
@@ -82,25 +82,24 @@ jobs:
           echo "sid=$SID" >> $GITHUB_OUTPUT
           echo "cid=$CID" >> $GITHUB_OUTPUT
 
-      # ---- Upload scripts to S3 (so instances can pull them) ----
+      # ---- UPLOAD SCRIPTS ----
       - name: Upload scripts to S3
         run: |
           BUCKET="${{ steps.tf.outputs.results_bucket }}"
           PREFIX="${{ env.RESULTS_PREFIX }}"
           aws s3 cp scripts/server_prep.sh     "s3://${BUCKET}/${PREFIX}scripts/server_prep.sh"
           aws s3 cp scripts/run_experiments.sh "s3://${BUCKET}/${PREFIX}scripts/run_experiments.sh"
-          aws s3 cp scripts/rhybrid_agent.sh "s3://${BUCKET}/${PREFIX}scripts/rhybrid_agent.sh"
-          aws s3 cp scripts/rhybrid_apply.sh "s3://${BUCKET}/${PREFIX}scripts/rhybrid_apply.sh"
+          aws s3 cp scripts/rhybrid_agent.sh   "s3://${BUCKET}/${PREFIX}scripts/rhybrid_agent.sh"
+          aws s3 cp scripts/rhybrid_apply.sh   "s3://${BUCKET}/${PREFIX}scripts/rhybrid_apply.sh"
 
-      # ---- SERVER PREP via SSM (robust install; capture logs to S3) ----
-      - name: Prep server via SSM (by tag)
+      # ---- SERVER PREP ----
+      - name: Prep server via SSM
         id: prep_server
         run: |
           BUCKET="${{ steps.tf.outputs.results_bucket }}"
           PREFIX="${{ env.RESULTS_PREFIX }}"
           OUT_PREFIX="${PREFIX}ssm/server-prep"
 
-          # Use the consistent __PLACEHOLDER__ convention
           cat > cmd_server.json <<'EOF'
           {
             "commands": [
@@ -112,11 +111,10 @@ jobs:
           }
           EOF
 
-          # Update sed to match the new, robust placeholders
           sed -i "s|__BUCKET__|${BUCKET}|g; s|__PREFIX__|${PREFIX}|g" cmd_server.json
 
           CMD_ID=$(aws ssm send-command \
-            --targets "Key=tag:Name,Values=network-test-server" \
+            --instance-ids "${{ steps.ssmwait.outputs.sid }}" \
             --document-name "AWS-RunShellScript" \
             --parameters file://cmd_server.json \
             --comment "Prep iperf3+httpd on server" \
@@ -128,7 +126,6 @@ jobs:
             --output json | jq -r '.Command.CommandId')
           echo "cmd_id=$CMD_ID" >> $GITHUB_OUTPUT
 
-          # Wait & show logs on failure
           while true; do
             STATUS=$(aws ssm list-command-invocations \
               --command-id "$CMD_ID" \
@@ -146,30 +143,31 @@ jobs:
             sleep 5
           done
 
-          # print success logs
           aws s3 cp "s3://${BUCKET}/${OUT_PREFIX}/${CMD_ID}/" ./ssm-prep-logs --recursive || true
           cat ./ssm-prep-logs/*stdout* 2>/dev/null || true
           cat ./ssm-prep-logs/*stderr* 2>/dev/null || true
-      
+
+      # ---- CLIENT PREP (R-HYBRID APPLY SCRIPT) ----
       - name: Prep client for R-Hybrid
         run: |
           BUCKET="${{ steps.tf.outputs.results_bucket }}"
           PREFIX="${{ env.RESULTS_PREFIX }}"
           aws ssm send-command \
-            --targets "Key=tag:Name,Values=${{ steps.tf.outputs.client_name }}" \
+            --instance-ids "${{ steps.ssmwait.outputs.cid }}" \
             --document-name "AWS-RunShellScript" \
             --parameters "commands=[
               \"aws s3 cp s3://${BUCKET}/${PREFIX}scripts/rhybrid_apply.sh /home/ec2-user/scripts/rhybrid_apply.sh\",
               \"chmod +x /home/ec2-user/scripts/rhybrid_apply.sh\"
             ]" \
             --comment "Install R-Hybrid apply script"
-      
+
+      # ---- LAUNCH R-HYBRID AGENT ----
       - name: Launch R-Hybrid Agent (receiver)
         run: |
           BUCKET="${{ steps.tf.outputs.results_bucket }}"
           PREFIX="${{ env.RESULTS_PREFIX }}"
           aws ssm send-command \
-            --targets "Key=tag:Name,Values=network-test-server" \
+            --instance-ids "${{ steps.ssmwait.outputs.sid }}" \
             --document-name "AWS-RunShellScript" \
             --parameters "commands=[
               \"aws s3 cp s3://${BUCKET}/${PREFIX}scripts/rhybrid_agent.sh /home/ec2-user/scripts/rhybrid_agent.sh\",
@@ -178,8 +176,8 @@ jobs:
             ]" \
             --comment "Start R-Hybrid receiver agent"
 
-      # ---- RUN EXPERIMENTS via SSM (client) ----
-      - name: Run experiments via SSM (by tag)
+      # ---- RUN EXPERIMENTS ----
+      - name: Run experiments via SSM (client)
         id: run_client
         run: |
           BUCKET="${{ steps.tf.outputs.results_bucket }}"
@@ -196,11 +194,10 @@ jobs:
           }
           EOF
 
-          # Use sed to safely substitute placeholders with actual values
           sed -i "s|__BUCKET__|${BUCKET}|g; s|__PREFIX__|${PREFIX}|g; s|__RESULT_S3_URI__|${RESULT_S3_URI}|g; s|__SERVER_IP__|${SERVER_IP}|g" cmd_client.json
 
           CMD_ID=$(aws ssm send-command \
-            --targets "Key=tag:Name,Values=${{ steps.tf.outputs.client_name }}" \
+            --instance-ids "${{ steps.ssmwait.outputs.cid }}" \
             --document-name "AWS-RunShellScript" \
             --parameters file://cmd_client.json \
             --comment "Install tools and run experiments" \
@@ -229,12 +226,11 @@ jobs:
             sleep 5
           done
 
-          # optional: print success logs
           aws s3 cp "s3://${BUCKET}/${OUT_PREFIX}/${CMD_ID}/" ./ssm-run-logs --recursive || true
           cat ./ssm-run-logs/*stdout* 2>/dev/null || true
           cat ./ssm-run-logs/*stderr* 2>/dev/null || true
 
-      # ---- DOWNLOAD + ANALYZE ----
+      # ---- DOWNLOAD RESULTS ----
       - name: Download latest CSV from S3
         run: |
           mkdir -p results
@@ -242,6 +238,7 @@ jobs:
             --recursive --exclude "*" --include "net-experiments-*.csv"
           ls -l results || true
 
+      # ---- ANALYZE ----
       - name: Analyze results → charts
         run: |
           python3 -m pip install --upgrade pip
@@ -258,7 +255,7 @@ jobs:
             results/net-experiments-*.csv
             fig_*.png
 
-      # ---- ALWAYS DESTROY (avoid collisions, keep costs near-zero) ----
+      # ---- CLEAN UP ----
       - name: Terraform destroy (final)
         if: always()
         run: terraform destroy -auto-approve -input=false
