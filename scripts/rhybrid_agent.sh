@@ -15,8 +15,8 @@ BASELINE_FILE="/tmp/rhybrid_baseline_rtt"
 WINDOW_SEC=5                   # interval between samples
 HISTORY_SIZE=5                 # number of samples to keep (sliding window)
 THRESH_RTT=5                   # ms above baseline to count as congestion
-THRESH_ECN=0                   # any CE mark counts as signal
-THRESH_RETR=0                  # any retrans counts as signal
+THRESH_ECN=1                   
+THRESH_RETR=1                  
 REQUIRED_CONSEC=3              # require M consecutive detections before flipping
 COOLDOWN_SEC=15                # minimum time between flips (seconds)
 PING_COUNT=20
@@ -99,7 +99,7 @@ decide_regime() {
   local total=$HISTORY_SIZE
   local ratio=$(( congest_count * 100 / total ))
   # Simple heuristic: if more than half of history shows congestion → SHARED
-  if (( congest_count >= (total / 2 + 1) )); then
+  if (( congest_count >= ( (total*3) / 5 ) )); then
     echo "SHARED"
   else
     echo "SINGLE_OWNER"
