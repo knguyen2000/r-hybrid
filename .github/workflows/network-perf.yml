@@ -42,6 +42,7 @@ jobs:
         id: tf
         run: |
           echo "server=$(terraform output -raw server_private_ip)" >> $GITHUB_OUTPUT
+          echo "client_private=$(terraform output -raw client_private_ip)" >> $GITHUB_OUTPUT
           echo "client=$(terraform output -raw client_public_ip)" >> $GITHUB_OUTPUT
           echo "client_name=$(terraform output -raw client_name_tag)" >> $GITHUB_OUTPUT
           echo "results_bucket=$(terraform output -raw results_bucket_name)" >> $GITHUB_OUTPUT
@@ -181,7 +182,7 @@ jobs:
               "echo '==> Running server prep (installing packages)... This may take a few minutes on a t3.micro.'",
               "sudo /tmp/server_prep.sh",
               "echo '==> Server prep finished. Launching receiver agent...'",
-              "nohup sudo /tmp/receiver_agent.sh __SERVER_IP__ > /var/log/receiver_agent.log 2>&1 &",
+              "nohup sudo /tmp/receiver_agent.sh __CLIENT_IP__ > /var/log/receiver_agent.log 2>&1 &",
               "echo 'Agent launched. Waiting 5s before checking log...'",
               "sleep 5",
               "echo '--- Last 10 lines of receiver_agent.log ---'",
@@ -190,7 +191,7 @@ jobs:
           }
           EOF
 
-          sed -i "s|__BUCKET__|${BUCKET}|g; s|__PREFIX__|${PREFIX}|g; s|__SERVER_IP__|${SERVER_IP}|g" cmd_server.json
+          sed -i "s|__BUCKET__|${BUCKET}|g; s|__PREFIX__|${PREFIX}|g; s|__SERVER_IP__|${SERVER_IP}|g; s|__CLIENT_IP__|${CLIENT_IP}|g" cmd_server.json
 
           CMD_ID=$(aws ssm send-command \
             --instance-ids ${{ steps.ssmwait.outputs.sid }} \

@@ -13,3 +13,8 @@ output "client_name_tag" {
 output "results_bucket_name" {
   value = aws_s3_bucket.results.bucket
 }
+
+output "client_private_ip" {
+  description = "Private IP of the client instance"
+  value       = aws_instance.client.private_ip
+}
