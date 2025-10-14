@@ -7,7 +7,7 @@ LOG="/var/log/cc_switch_events.csv"
 BASELINE_RTT=$(ping -c 5 $SERVER_IP | awk -F'/' '/rtt/ {print $5}')
 CURRENT_MODE=$(sysctl -n net.ipv4.tcp_congestion_control)
 START_TS=$(date +%s)
-THRESHOLD=1.2  # RTT tail inflation threshold
+THRESHOLD=1.5  # RTT tail inflation threshold
 
 if [[ ! -f "$LOG" ]]; then
   echo "timestamp,experiment,cc_mode,duration_s" | sudo tee -a "$LOG" >/dev/null

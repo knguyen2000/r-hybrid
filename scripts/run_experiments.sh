@@ -99,7 +99,11 @@ csv_header
 run_bundle() {
   local EXP="$1" TOPO="$2" CC="$3" MTU="$4" IMP="$5" LOAD="$6" NOTES="$7"
   echo "[*] $EXP: topo=$TOPO cc=$CC mtu=$MTU impair=$IMP load=$LOAD"
-  cc_set "$CC"
+  if [[ "$CC" != "hybrid" ]]; then
+    cc_set "$CC"
+  else
+    echo "Running hybrid test, CC will be managed by the receiver agent."
+  fi
   mtu_set "$MTU"
   case "$IMP" in
     none) impair_set 0 0 ;;
