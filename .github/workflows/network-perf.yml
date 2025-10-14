@@ -79,9 +79,9 @@ jobs:
         run: |
           BUCKET="${{ steps.tf.outputs.results_bucket }}"
           PREFIX="${{ env.RESULTS_PREFIX }}"
-          aws s3 cp server_prep.sh "s3://${BUCKET}/${PREFIX}scripts/server_prep.sh"
-          aws s3 cp run_experiments.sh "s3://${BUCKET}/${PREFIX}scripts/run_experiments.sh"
-          aws s3 cp receiver_agent.sh "s3://${BUCKET}/${PREFIX}scripts/receiver_agent.sh"
+          aws s3 cp scripts/server_prep.sh "s3://${BUCKET}/${PREFIX}scripts/server_prep.sh"
+          aws s3 cp scripts/run_experiments.sh "s3://${BUCKET}/${PREFIX}scripts/run_experiments.sh"
+          aws s3 cp scripts/receiver_agent.sh "s3://${BUCKET}/${PREFIX}scripts/receiver_agent.sh"
 
       - name: Prep servers and launch agents via SSM
         run: |
@@ -174,10 +174,14 @@ jobs:
             echo "Telling $NAME to upload its logs..."
             S3_URI_CSV="s3://${BUCKET}/${PREFIX}cc_switch_events_${NAME}.csv"
             S3_URI_LOG="s3://${BUCKET}/${PREFIX}receiver_agent_${NAME}.log"
+            
+            # FIX: Replaced single quotes (') with escaped double quotes (\")
+            # to create a valid JSON array of strings.
             COMMANDS="[ \
-              'if [ -f /var/log/cc_switch_events.csv ]; then aws s3 cp /var/log/cc_switch_events.csv ${S3_URI_CSV}; fi', \
-              'if [ -f /var/log/receiver_agent.log ]; then aws s3 cp /var/log/receiver_agent.log ${S3_URI_LOG}; fi' \
+              \"if [ -f /var/log/cc_switch_events.csv ]; then aws s3 cp /var/log/cc_switch_events.csv ${S3_URI_CSV}; fi\", \
+              \"if [ -f /var/log/receiver_agent.log ]; then aws s3 cp /var/log/receiver_agent.log ${S3_URI_LOG}; fi\" \
             ]"
+            
             aws ssm send-command --instance-ids "$IID" --document-name "AWS-RunShellScript" --parameters "{\"commands\":$COMMANDS}"
           }
           
